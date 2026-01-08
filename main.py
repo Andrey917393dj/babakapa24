@@ -1,215 +1,221 @@
 import asyncio
-import requests
+import aiohttp
 import json
-import csv
-import random
-from datetime import datetime
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import (
-    ReplyKeyboardMarkup,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    InputMediaPhoto
-)
 import os
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from bs4 import BeautifulSoup
+from datetime import datetime
 
-# ================= НАСТРОЙКИ =================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ACCESS_CODE = "130290"
+# ================== НАСТРОЙКИ ==================
+UNLOCK_CODE = "130290"
 
-SEARCH_URL = "https://m.olx.ua/uk/elektronika/kompyutery-i-komplektuyuschie/komplektuyuschie-i-aksesuary/q-gtx-1080-ti-11gb/?search%5Border%5D=created_at%3Adesc"
+OLX_URL = "https://m.olx.ua/uk/elektronika/kompyutery-i-komplektuyuschie/komplektuyuschie-i-aksesuary/q-gtx-1080-ti-11gb/?search%5Border%5D=created_at%3Adesc"
 
-# ================= СОСТОЯНИЕ =================
-authorized_users = set()
-known_ads = {}  # url -> price
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 Chrome/120.0",
+    "Accept-Language": "uk-UA,uk;q=0.9",
+    "Referer": "https://www.olx.ua/"
+}
 
-auto_check_enabled = True
-check_interval = 300
-track_limit = 5
+DATA_FILE = "data.json"
 
-min_price = 0
-max_price = 999999
-filter_brands = ["ASUS", "ZOTAC", "MSI"]
-filter_areas = []
+# ===============================================
 
-bot = Bot(BOT_TOKEN)
+bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher(bot)
 
-# ================= КНОПКИ =================
+users = {}
+ads_cache = set()
+
+# ================== КНОПКИ ==================
 def main_kb():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("📥 Получить данные")
-    kb.add("⚙ Настройки", "📊 Статус")
-    kb.add("🧹 Очистить память", "🛑 Стоп авто")
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("📥 Получить данные", callback_data="get_ads"),
+        InlineKeyboardButton("⚙️ Настройки", callback_data="settings")
+    )
     return kb
+
 
 def settings_kb():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("1️⃣ Авто ВКЛ/ВЫКЛ")
-    kb.add("2️⃣ Интервал", "3️⃣ Лимит")
-    kb.add("4️⃣ Мин цена", "5️⃣ Макс цена")
-    kb.add("⬅ Назад")
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("✅ Авточекер", callback_data="toggle_auto"),
+        InlineKeyboardButton("⏱ Интервал чекера", callback_data="interval"),
+        InlineKeyboardButton("📊 Кол-во объявлений", callback_data="limit"),
+        InlineKeyboardButton("🔍 Фильтр цены", callback_data="filter"),
+        InlineKeyboardButton("💾 Сохранить", callback_data="save"),
+        InlineKeyboardButton("⬅️ Назад", callback_data="back")
+    )
     return kb
 
-# ================= OLX =================
-def fetch_offers():
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(SEARCH_URL, headers=headers, timeout=15)
-        text = r.text
-        start = text.find('"offers":{')
-        end = text.find('},"sort":', start)
-        if start == -1 or end == -1:
-            return []
-        raw = text[start + 9:end + 1]
-        data = json.loads(raw)
-        return data.get("offers", [])
-    except Exception as e:
-        print("OLX error:", e)
-        return []
 
-# ================= ОСНОВНАЯ ЛОГИКА =================
-async def send_ads(chat_id, force_show=False):
-    offers = fetch_offers()
-    sent = 0
+# ================== ЗАГРУЗКА ДАННЫХ ==================
+def load_data():
+    global users, ads_cache
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            users = data.get("users", {})
+            ads_cache = set(data.get("ads", []))
 
-    for o in offers:
-        url = o.get("url")
-        price = o.get("price", 0)
-        name = o.get("name", "")
-        area = o.get("areaServed", {}).get("name", "—")
-        images = o.get("image", [])
-        description = o.get("description", "")
 
-        if not (min_price <= price <= max_price):
-            continue
-        if not any(b.upper() in name.upper() for b in filter_brands):
-            continue
-        if filter_areas and area not in filter_areas:
+def save_data():
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump({"users": users, "ads": list(ads_cache)}, f, ensure_ascii=False, indent=2)
+
+
+# ================== OLX ПАРСЕР ==================
+async def fetch_ads(limit=5):
+    ads = []
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        async with session.get(OLX_URL, timeout=20) as resp:
+            html = await resp.text()
+
+    soup = BeautifulSoup(html, "lxml")
+
+    for a in soup.select("a[href*='/obyavlenie/']"):
+        title = a.get_text(strip=True)
+        link = a.get("href")
+        if not link.startswith("http"):
+            link = "https://www.olx.ua" + link
+
+        if link in ads_cache:
             continue
 
-        # автопроверка — только новое
-        if not force_show and url in known_ads:
-            continue
+        ads.append({
+            "title": title[:80],
+            "url": link,
+            "time": datetime.now().strftime("%H:%M:%S")
+        })
 
-        # обновление цены
-        if url in known_ads and price < known_ads[url]:
-            await bot.send_message(
-                chat_id,
-                f"💰 Цена снижена!\n{name}\nБыло: {known_ads[url]} грн\nСтало: {price} грн\n{url}"
-            )
-
-        known_ads[url] = price
-
-        short_desc = description[:400]
-        if len(description) > 400:
-            short_desc += "..."
-
-        text = (
-            f"🔔 <b>{name}</b>\n"
-            f"💰 <b>{price} грн</b>\n"
-            f"📍 {area}\n\n"
-            f"{short_desc}\n\n"
-            f"🔗 {url}"
-        )
-
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("Открыть OLX", url=url))
-        if description:
-            kb.add(InlineKeyboardButton("Показать полностью", callback_data=f"desc|{url}"))
-
-        # картинки
-        if images:
-            media = [InputMediaPhoto(img) for img in images]
-            await bot.send_media_group(chat_id, media)
-
-        await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
-
-        sent += 1
-        if sent >= track_limit:
+        if len(ads) >= limit:
             break
 
-    if sent == 0:
-        await bot.send_message(chat_id, "ℹ️ По текущим фильтрам объявлений нет.")
+    return ads
 
-# ================= АВТОЧЕКЕР =================
-async def auto_checker():
-    while True:
-        if auto_check_enabled:
-            for uid in authorized_users:
-                await send_ads(uid, force_show=False)
-        await asyncio.sleep(check_interval + random.randint(10, 30))
 
-# ================= CALLBACK =================
-@dp.callback_query_handler(lambda c: c.data.startswith("desc|"))
-async def full_desc(c: types.CallbackQuery):
-    url = c.data.split("|", 1)[1]
-    await c.message.answer("📄 Полное описание доступно на OLX:\n" + url)
-    await c.answer()
-
-# ================= ХЕНДЛЕРЫ =================
+# ================== КОМАНДЫ ==================
 @dp.message_handler(commands=["start"])
-async def start(m: types.Message):
-    if m.from_user.id not in authorized_users:
-        await m.answer("🔒 Доступ заблокирован.\nВведите код.")
+async def start(msg: types.Message):
+    uid = str(msg.from_user.id)
+
+    if uid not in users:
+        users[uid] = {
+            "unlocked": False,
+            "auto": False,
+            "interval": 60,
+            "limit": 2,
+            "price_min": 0,
+            "price_max": 999999
+        }
+        save_data()
+
+    if not users[uid]["unlocked"]:
+        await msg.answer("🔒 Доступ заблокирован\n\nВведите код доступа:")
     else:
-        await m.answer("✅ Бот активен", reply_markup=main_kb())
+        await msg.answer("✅ Бот активен", reply_markup=main_kb())
 
-@dp.message_handler(lambda m: m.text == ACCESS_CODE)
-async def unlock(m: types.Message):
-    authorized_users.add(m.from_user.id)
-    await m.answer("✅ Доступ открыт", reply_markup=main_kb())
 
-@dp.message_handler(lambda m: m.text == "📥 Получить данные")
-async def manual(m: types.Message):
-    await send_ads(m.from_user.id, force_show=True)
+@dp.message_handler()
+async def unlock(msg: types.Message):
+    uid = str(msg.from_user.id)
 
-@dp.message_handler(lambda m: m.text == "⚙ Настройки")
-async def settings(m: types.Message):
-    await m.answer("⚙ Настройки:", reply_markup=settings_kb())
+    if not users.get(uid):
+        return
 
-@dp.message_handler(lambda m: m.text == "📊 Статус")
-async def status(m: types.Message):
-    await m.answer(
-        f"Авто: {auto_check_enabled}\n"
-        f"Интервал: {check_interval} сек\n"
-        f"Лимит: {track_limit}\n"
-        f"Цена: {min_price} – {max_price}"
-    )
+    if not users[uid]["unlocked"]:
+        if msg.text.strip() == UNLOCK_CODE:
+            users[uid]["unlocked"] = True
+            save_data()
+            await msg.answer("🔓 Бот разблокирован", reply_markup=main_kb())
+        else:
+            await msg.answer("❌ Неверный код")
 
-@dp.message_handler(lambda m: m.text == "🧹 Очистить память")
-async def clear(m: types.Message):
-    known_ads.clear()
-    await m.answer("🧹 Память объявлений очищена")
 
-@dp.message_handler(lambda m: m.text == "🛑 Стоп авто")
-async def stop_auto(m: types.Message):
-    global auto_check_enabled
-    auto_check_enabled = False
-    await m.answer("🛑 Автопроверка остановлена")
+# ================== CALLBACK ==================
+@dp.callback_query_handler()
+async def callbacks(call: types.CallbackQuery):
+    uid = str(call.from_user.id)
 
-@dp.message_handler(lambda m: m.text.isdigit())
-async def numbers(m: types.Message):
-    global check_interval, track_limit, min_price, max_price
-    n = int(m.text)
+    if not users.get(uid, {}).get("unlocked"):
+        await call.answer("🔒 Нет доступа", show_alert=True)
+        return
 
-    if 30 <= n <= 3600:
-        check_interval = n
-        await m.answer(f"⏱ Интервал: {n} сек")
-    elif 1 <= n <= 20:
-        track_limit = n
-        await m.answer(f"📦 Лимит: {n}")
-    elif 100 <= n <= 100000:
-        min_price = n
-        await m.answer(f"⬇ Мин цена: {n}")
-    elif n > min_price:
-        max_price = n
-        await m.answer(f"⬆ Макс цена: {n}")
+    if call.data == "get_ads":
+        ads = await fetch_ads(users[uid]["limit"])
 
-# ================= ЗАПУСК =================
-async def main():
-    asyncio.create_task(auto_checker())
-    await dp.start_polling()
+        if not ads:
+            await call.message.answer("ℹ️ По текущим фильтрам объявлений нет.")
+            return
+
+        for ad in ads:
+            ads_cache.add(ad["url"])
+            await call.message.answer(
+                f"🆕 <b>{ad['title']}</b>\n"
+                f"🕒 {ad['time']}\n"
+                f"🔗 {ad['url']}",
+                parse_mode="HTML"
+            )
+
+        save_data()
+
+    elif call.data == "settings":
+        await call.message.edit_text("⚙️ Настройки:", reply_markup=settings_kb())
+
+    elif call.data == "toggle_auto":
+        users[uid]["auto"] = not users[uid]["auto"]
+        save_data()
+        await call.answer("Авточекер переключен")
+
+    elif call.data == "interval":
+        await call.message.answer("✍️ Напиши интервал в секундах")
+
+    elif call.data == "limit":
+        await call.message.answer("✍️ Сколько объявлений показывать?")
+
+    elif call.data == "filter":
+        await call.message.answer("✍️ Напиши цену: мин макс (пример: 5000 7000)")
+
+    elif call.data == "save":
+        save_data()
+        await call.answer("💾 Сохранено")
+
+    elif call.data == "back":
+        await call.message.edit_text("🏠 Главное меню", reply_markup=main_kb())
+
+
+# ================== АВТОЧЕКЕР ==================
+async def auto_checker():
+    await asyncio.sleep(10)
+    while True:
+        for uid, cfg in users.items():
+            if not cfg["auto"]:
+                continue
+
+            ads = await fetch_ads(cfg["limit"])
+            for ad in ads:
+                ads_cache.add(ad["url"])
+                try:
+                    await bot.send_message(
+                        uid,
+                        f"🔥 <b>Новое объявление!</b>\n"
+                        f"{ad['title']}\n"
+                        f"🔗 {ad['url']}",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+
+        save_data()
+        await asyncio.sleep(60)
+
+
+# ================== ЗАПУСК ==================
+load_data()
+loop = asyncio.get_event_loop()
+loop.create_task(auto_checker())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    executor.start_polling(dp, skip_updates=True)
