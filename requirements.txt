@@ -1,5 +1,3 @@
-aiogram==2.25.1
-aiohttp
-beautifulsoup4
-lxml
-curl-cffi
+aiogram==2.25.2
+requests==2.31.0
+beautifulsoup4==4.12.3
