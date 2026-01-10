@@ -17,7 +17,6 @@ bot = telebot.TeleBot(TOKEN)
 
 # --- УТИЛИТЫ ---
 def to_float(text):
-    """Превращает текст с запятой или точкой в число"""
     try:
         return float(text.replace(',', '.').strip())
     except ValueError:
@@ -35,7 +34,6 @@ def get_ud(user_id):
     db = load_db()
     uid = str(user_id)
     if uid not in db:
-        # start_inv по умолчанию ставим 4420 (твои вложения), но можно менять
         db[uid] = {'auth': False, 'bal_uah': 0.0, 'buy_rate': 0.0, 'sell_rate': 0.0, 'extra_usdt': 0.0, 'start_inv': 4420.0}
         save_db(db)
     return db[uid]
@@ -45,28 +43,46 @@ def update_ud(user_id, key, val):
     db[str(user_id)][key] = float(val)
     save_db(db)
 
-# --- МОНИТОРИНГ (Запрос к API) ---
-def fetch_real_ads(ad_type="BUY"):
-    # Эндпоинт, который используется веб-версией
-    url = "https://walletbot.me/api/v1/p2p/advertisements" 
+# --- НОВЫЙ СКАНЕР (FIX 404) ---
+def fetch_real_ads(user_intent="BUY"):
+    """
+    user_intent="BUY" -> Мы хотим купить -> Ищем объявления типа 'sale' (люди продают нам)
+    user_intent="SELL" -> Мы хотим продать -> Ищем объявления типа 'purchase' (люди покупают у нас)
+    """
+    url = "https://p2p.wallet.tg/gw/p2p/items"
+    
+    # Для API Wallet:
+    # type "sale" = Продавцы (у них мы покупаем, кнопка BUY)
+    # type "purchase" = Покупатели (им мы продаем, кнопка SELL)
+    req_type = "sale" if user_intent == "BUY" else "purchase"
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+        "Content-Type": "application/json",
+        "Origin": "https://p2p.wallet.tg",
+        "Referer": "https://p2p.wallet.tg/",
+        "x-requested-with": "XMLHttpRequest"
     }
     
-    params = {
+    # Тело запроса (фильтры)
+    payload = {
+        "asset": "USDT",
         "fiat": "UAH",
-        "crypto": "USDT",
-        "type": ad_type, # BUY или SELL
-        "amount": 100,   # Фильтр от 100 грн
-        "page": 1
+        "type": req_type,
+        "filter": {
+            "amount": 100 # Фильтр от 100 грн
+        },
+        "limit": 10,
+        "offset": 0
     }
     
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+        # Теперь используем POST
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        
         if response.status_code == 200:
-            return {"ok": True, "data": response.json().get('data', [])}
+            data = response.json()
+            return {"ok": True, "data": data.get('data', [])}
         else:
             return {"ok": False, "error": f"HTTP {response.status_code}"}
     except Exception as e:
@@ -97,12 +113,11 @@ def check_pass(message):
         bot.register_next_step_handler(bot.send_message(message.chat.id, "❌ Пароль:"), check_pass)
 
 # =======================
-# 1. РАСЧЕТ КРУГА (ИСПРАВЛЕННЫЙ)
+# 1. РАСЧЕТ КРУГА (FIX ПРИБЫЛИ)
 # =======================
 @bot.message_handler(func=lambda m: m.text == "💸 Расчет круга")
 def circ_1(message):
     ud = get_ud(message.from_user.id)
-    # Предлагаем прошлое значение
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     if ud.get('bal_uah'): markup.add(f"{ud['bal_uah']}")
     
@@ -116,12 +131,11 @@ def circ_2(message):
         return main_menu(message)
     
     update_ud(message.from_user.id, 'bal_uah', val)
-    
     ud = get_ud(message.from_user.id)
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     if ud.get('buy_rate'): markup.add(f"{ud['buy_rate']}")
     
-    msg = bot.send_message(message.chat.id, "2️⃣ Почем берем? Курс <b>BUY</b>:", reply_markup=markup, parse_mode="HTML")
+    msg = bot.send_message(message.chat.id, "2️⃣ Курс <b>BUY</b> (по чем берем?):", reply_markup=markup, parse_mode="HTML")
     bot.register_next_step_handler(msg, circ_3)
 
 def circ_3(message):
@@ -132,15 +146,14 @@ def circ_3(message):
     update_ud(uid, 'buy_rate', buy_rate)
     ud = get_ud(uid)
     
-    # Считаем, сколько купим
     bought_usdt = ud['bal_uah'] / buy_rate
     
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    markup.add("0") # Кнопка для быстрого ввода
+    markup.add("0")
     if ud.get('extra_usdt'): markup.add(f"{ud['extra_usdt']}")
     
-    text = (f"✅ На {ud['bal_uah']} грн ты купишь <code>{bought_usdt:.4f} USDT</code>\n\n"
-            f"3️⃣ Сколько <b>USDT уже есть</b> на балансе? (Введи 0, если пусто):")
+    text = (f"✅ На {ud['bal_uah']} грн выйдет <code>{bought_usdt:.4f} USDT</code>\n\n"
+            f"3️⃣ Сколько <b>дополнительно USDT</b> есть на балансе? (0 если нет):")
     
     msg = bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="HTML")
     bot.register_next_step_handler(msg, circ_4)
@@ -151,12 +164,12 @@ def circ_4(message):
     
     uid = message.from_user.id
     update_ud(uid, 'extra_usdt', extra)
-    
     ud = get_ud(uid)
+    
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     if ud.get('sell_rate'): markup.add(f"{ud['sell_rate']}")
     
-    msg = bot.send_message(message.chat.id, "4️⃣ Почем сливаем? Курс <b>SELL</b>:", reply_markup=markup, parse_mode="HTML")
+    msg = bot.send_message(message.chat.id, "4️⃣ Курс <b>SELL</b> (по чем сливаем?):", reply_markup=markup, parse_mode="HTML")
     bot.register_next_step_handler(msg, circ_final)
 
 def circ_final(message):
@@ -167,34 +180,37 @@ def circ_final(message):
     update_ud(uid, 'sell_rate', sell_rate)
     ud = get_ud(uid)
     
-    # Расчет
+    # 1. Считаем USDT
     bought_usdt = ud['bal_uah'] / ud['buy_rate']
     total_usdt = bought_usdt + ud['extra_usdt']
     
+    # 2. Считаем выход
     dirty_uah = total_usdt * sell_rate
-    # Комиссия 0.9% (умножаем на 0.991)
-    clean_uah = dirty_uah * 0.991
+    clean_uah = dirty_uah * 0.991 # Комиссия 0.9%
     
-    # Профит = То что получили - То что потратили сейчас
-    # Внимание: тут считаем профит круга. Если добавленные USDT были "бесплатные", это профит.
-    # Но обычно считают: (Выход - Вход UAH). 
-    # Если extra_usdt > 0, расчет сложнее, но покажем просто итоговую сумму.
+    # 3. Считаем ПРОФИТ (Именно для этого круга)
+    # Если мы подмешивали extra_usdt, расчет профита сложнее, 
+    # но обычно арбитражнику важно: (Чистый выход - (Вход UAH + Стоимость доп. USDT))
+    # Для простоты считаем: Прибыль = Чистый выход - Вход UAH (Считаем что extra_usdt - это уже профит с прошлого раза)
     
-    res = (f"🏁 <b>Результат:</b>\n"
+    profit = clean_uah - ud['bal_uah']
+    # Если были extra usdt, прибыль будет казаться огромной, это нормально, это "касса".
+    
+    res = (f"🏁 <b>ФИНАЛ КРУГА:</b>\n"
            f"🔸 Куплено: {bought_usdt:.2f} USDT\n"
-           f"🔸 Было доп: {ud['extra_usdt']:.2f} USDT\n"
-           f"💰 Всего на продажу: <b>{total_usdt:.2f} USDT</b>\n"
+           f"🔸 Доп. крипта: {ud['extra_usdt']:.2f} USDT\n"
+           f"💰 Продаем: <b>{total_usdt:.2f} USDT</b>\n"
            f"➖➖➖➖➖➖\n"
            f"💵 Грязными: {dirty_uah:.2f} грн\n"
-           f"💳 <b>Чистыми на карту: {clean_uah:.2f} грн</b>\n"
-           f"(с учетом комсы 0.9%)")
+           f"💳 Чистыми: {clean_uah:.2f} грн\n"
+           f"🤑 <b>ПРИБЫЛЬ (Навар): +{profit:.2f} грн</b>\n"
+           f"(Прибыль = Чистыми - Закуп {ud['bal_uah']} грн)")
     
     bot.send_message(message.chat.id, res, parse_mode="HTML")
     main_menu(message)
 
-
 # =======================
-# 2. ОБЩИЙ ПРОФИТ (ИСПРАВЛЕННЫЙ)
+# 2. ОБЩИЙ ПРОФИТ
 # =======================
 @bot.message_handler(func=lambda m: m.text == "📊 Общий профит")
 def profit_1(message):
@@ -204,7 +220,6 @@ def profit_1(message):
 def profit_2(message):
     val = to_float(message.text)
     if val is None: return main_menu(message)
-    # Сохраним временно в user_data в памяти (не в базу, чтобы не путать с кругом)
     bot.user_data = getattr(bot, 'user_data', {})
     if message.chat.id not in bot.user_data: bot.user_data[message.chat.id] = {}
     bot.user_data[message.chat.id]['temp_card'] = val
@@ -218,11 +233,10 @@ def profit_3(message):
     bot.user_data[message.chat.id]['temp_usdt'] = val
     
     ud = get_ud(message.from_user.id)
-    # Предлагаем последний курс продажи
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     if ud.get('sell_rate'): markup.add(f"{ud['sell_rate']}")
     
-    msg = bot.send_message(message.chat.id, "3️⃣ По какому курсу считаем USDT в грн? (Курс продажи):", reply_markup=markup)
+    msg = bot.send_message(message.chat.id, "3️⃣ По какому курсу считать крипту? (Курс продажи):", reply_markup=markup)
     bot.register_next_step_handler(msg, profit_4)
 
 def profit_4(message):
@@ -231,18 +245,15 @@ def profit_4(message):
     bot.user_data[message.chat.id]['temp_rate'] = val
     
     ud = get_ud(message.from_user.id)
-    # Предлагаем сохраненные стартовые
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     markup.add(f"{ud.get('start_inv', 4420)}")
     
-    msg = bot.send_message(message.chat.id, "4️⃣ Сколько всего было <b>вложено своих</b> денег (депозит)?", reply_markup=markup, parse_mode="HTML")
+    msg = bot.send_message(message.chat.id, "4️⃣ Сколько всего было <b>вложено своих</b> денег?", reply_markup=markup, parse_mode="HTML")
     bot.register_next_step_handler(msg, profit_final)
 
 def profit_final(message):
     start_inv = to_float(message.text)
     if start_inv is None: return main_menu(message)
-    
-    # Обновляем стартовые в базе навсегда
     update_ud(message.from_user.id, 'start_inv', start_inv)
     
     data = bot.user_data[message.chat.id]
@@ -250,70 +261,73 @@ def profit_final(message):
     usdt_money = data['temp_usdt']
     rate = data['temp_rate']
     
-    # Формула: (USDT * Rate * 0.991) + Card - Start
+    # Считаем капитал
     usdt_in_uah = (usdt_money * rate) * 0.991
     total_assets = card_money + usdt_in_uah
     total_profit = total_assets - start_inv
     
-    res = (f"📊 <b>Калькуляция капитала:</b>\n"
+    roi = (total_profit / start_inv) * 100 if start_inv > 0 else 0
+    
+    res = (f"📊 <b>ИТОГИ ДНЯ:</b>\n"
            f"💳 На карте: {card_money} грн\n"
            f"💵 В крипте: ~{usdt_in_uah:.2f} грн\n"
            f"💰 <b>Всего активов: {total_assets:.2f} грн</b>\n"
            f"🔻 Депозит: {start_inv} грн\n"
            f"➖➖➖➖➖➖\n"
            f"🚀 <b>ЧИСТЫЙ ПРОФИТ: {total_profit:.2f} грн</b>\n"
-           f"Рост банка: { (total_profit/start_inv)*100 :.2f}%")
+           f"📈 Рост банка: +{roi:.2f}%")
     
     bot.send_message(message.chat.id, res, parse_mode="HTML")
     main_menu(message)
 
 
 # =======================
-# 3. СКАНЕР (РЕАЛЬНЫЙ ЗАПРОС)
+# 3. СКАНЕР (FIX 404 -> POST)
 # =======================
 @bot.message_handler(func=lambda m: m.text == "🔍 Сканер стакана")
 def scan_p2p(message):
-    bot.send_message(message.chat.id, "📡 Сканирую стакан Wallet...")
+    bot.send_message(message.chat.id, "📡 Сканирую Wallet (POST запрос)...")
     
-    # 1. Получаем BUY (кого мы покупаем)
     buy_res = fetch_real_ads("BUY")
-    # 2. Получаем SELL (кому мы продаем)
     sell_res = fetch_real_ads("SELL")
     
     msg = ""
     
-    # Обработка BUY
+    # Вывод BUY (Мы покупаем)
     if buy_res['ok']:
-        items = buy_res['data'][:2] # берем топ 2
-        msg += "📥 <b>ЛУЧШИЕ ЦЕНЫ ЗАКУПА:</b>\n"
-        if not items: msg += "Пусто или лимиты не подходят.\n"
-        for i in items:
-            price = i.get('price')
-            name = i.get('user', {}).get('name', 'Anon')
-            lim_min = i.get('min_amount')
-            lim_max = i.get('max_amount')
-            msg += f"🔹 <b>{price}</b> | {name} | {lim_min}-{lim_max}\n"
-    else:
-        msg += f"📥 Ошибка BUY: {buy_res['error']}\n"
-        
-    msg += "\n"
-    
-    # Обработка SELL
-    if sell_res['ok']:
-        items = sell_res['data'][:2]
-        msg += "📤 <b>ЛУЧШИЕ ЦЕНЫ ПРОДАЖИ:</b>\n"
+        items = buy_res['data'][:2]
+        msg += "📥 <b>ТОП-2 ЗАКУП (По чем продают нам):</b>\n"
         if not items: msg += "Пусто.\n"
         for i in items:
             price = i.get('price')
-            name = i.get('user', {}).get('name', 'Anon')
-            lim_min = i.get('min_amount')
-            lim_max = i.get('max_amount')
-            msg += f"🔸 <b>{price}</b> | {name} | {lim_min}-{lim_max}\n"
+            # Имя юзера может быть в разных полях в зависимости от версии API
+            name = i.get('user', {}).get('nickname') or i.get('user', {}).get('name') or "Anon"
+            limit = i.get('available_amount', 0) 
+            # Иногда лимиты в min_amount/max_amount
+            l_min = i.get('min_amount')
+            l_max = i.get('max_amount')
+            
+            msg += f"🔹 <b>{price}</b> | {name} | {l_min}-{l_max}\n"
+    else:
+        msg += f"📥 Ошибка BUY: {buy_res['error']}\n"
+    
+    msg += "\n"
+    
+    # Вывод SELL (Мы продаем)
+    if sell_res['ok']:
+        items = sell_res['data'][:2]
+        msg += "📤 <b>ТОП-2 ПРОДАЖА (По чем покупают у нас):</b>\n"
+        if not items: msg += "Пусто.\n"
+        for i in items:
+            price = i.get('price')
+            name = i.get('user', {}).get('nickname') or i.get('user', {}).get('name') or "Anon"
+            l_min = i.get('min_amount')
+            l_max = i.get('max_amount')
+            msg += f"🔸 <b>{price}</b> | {name} | {l_min}-{l_max}\n"
     else:
         msg += f"📤 Ошибка SELL: {sell_res['error']}\n"
         
     bot.send_message(message.chat.id, msg, parse_mode="HTML")
-
 
 if __name__ == '__main__':
     bot.infinity_polling()
