@@ -250,12 +250,20 @@ async def check_authorization_middleware(
     data: Dict[str, Any]
 ) -> Any:
     """Middleware для проверки авторизации"""
-    user_id = event.from_user.id
-    message = event if isinstance(event, Message) else event.message
     
+    # Получаем состояние FSM
+    state = data.get('state')
+    if state:
+        current_state = await state.get_state()
+        # Если пользователь в процессе первичной настройки - пропускаем
+        if current_state and current_state.startswith('SystemSetup:'):
+            return await handler(event, data)
+    
+    user_id = event.from_user.id
     is_init = await is_system_initialized()
     
     if not is_init:
+        # Разрешаем только /start и callback для настройки
         if isinstance(event, Message) and event.text == "/start":
             return await handler(event, data)
         elif isinstance(event, CallbackQuery) and event.data.startswith("init_"):
@@ -268,6 +276,7 @@ async def check_authorization_middleware(
                 await event.answer(text, show_alert=True)
             return
     
+    # Если система инициализирована - проверяем права
     admin_id = await get_admin_id()
     if user_id != admin_id:
         text = "🚫 У вас нет доступа к этому боту."
