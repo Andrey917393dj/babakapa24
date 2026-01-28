@@ -17,6 +17,7 @@ import aiosqlite
 from cryptography.fernet import Fernet
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError
 
 # ==================== КОНФИГУРАЦИЯ ====================
 
@@ -255,8 +256,8 @@ async def check_authorization_middleware(
     state = data.get('state')
     if state:
         current_state = await state.get_state()
-        # Если пользователь в процессе первичной настройки - пропускаем
-        if current_state and current_state.startswith('SystemSetup:'):
+        # Если пользователь в процессе настройки - пропускаем
+        if current_state:
             return await handler(event, data)
     
     user_id = event.from_user.id
@@ -318,6 +319,114 @@ def get_main_menu_keyboard(has_accounts: bool = False) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text="📄 Логи", callback_data="logs_menu")]
     ])
+
+# ==================== ВОРКЕРЫ ====================
+
+class WorkerManager:
+    """Менеджер воркеров"""
+    def __init__(self):
+        self.workers = {}  # account_id -> worker_task
+    
+    async def start_worker(self, account_id: int, bot):
+        """Запуск воркера для аккаунта"""
+        if account_id in self.workers:
+            return False
+        
+        # Получение данных аккаунта
+        config = await get_system_config()
+        if not config:
+            return False
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("""
+                SELECT phone, session_data, greeting_text, cooldown_search, cooldown_send, cooldown_skip
+                FROM accounts WHERE id = ?
+            """, (account_id,))
+            account = await cursor.fetchone()
+        
+        if not account:
+            return False
+        
+        phone, encrypted_session, greeting, cd_search, cd_send, cd_skip = account
+        
+        # Расшифровка сессии
+        session_string = decrypt_session(encrypted_session, config['encryption_key'])
+        
+        # Создание клиента
+        client = TelegramClient(
+            StringSession(session_string),
+            config['api_id'],
+            config['api_hash']
+        )
+        
+        # Запуск воркера
+        task = asyncio.create_task(
+            self._worker_loop(account_id, client, greeting, cd_search, cd_send, cd_skip, bot)
+        )
+        self.workers[account_id] = task
+        
+        await log_to_db(account_id, "INFO", f"Воркер аккаунта {account_id} запущен")
+        return True
+    
+    async def _worker_loop(self, account_id, client, greeting, cd_search, cd_send, cd_skip, bot):
+        """Основной цикл воркера"""
+        try:
+            await client.connect()
+            await log_to_db(account_id, "INFO", f"Подключение установлено")
+            
+            # Обновление статуса
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("""
+                    UPDATE accounts SET status = 'searching', last_active = ? WHERE id = ?
+                """, (datetime.now(), account_id))
+                await db.commit()
+            
+            # TODO: Здесь будет логика работы с @ZnakomstvaAnonimniyChatBot
+            # Пока просто держим соединение открытым
+            await log_to_db(account_id, "INFO", "Воркер работает (TODO: реализовать логику)")
+            
+            # Имитация работы (удалить потом)
+            while account_id in self.workers:
+                await asyncio.sleep(10)
+                await log_to_db(account_id, "INFO", "Воркер активен")
+                
+        except Exception as e:
+            await log_to_db(account_id, "ERROR", f"Ошибка воркера: {e}")
+            
+            # Обновление статуса ошибки
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("""
+                    UPDATE accounts SET status = 'error', error_message = ? WHERE id = ?
+                """, (str(e), account_id))
+                await db.commit()
+        finally:
+            await client.disconnect()
+    
+    async def stop_worker(self, account_id: int):
+        """Остановка воркера"""
+        if account_id in self.workers:
+            self.workers[account_id].cancel()
+            del self.workers[account_id]
+            
+            # Обновление статуса
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("""
+                    UPDATE accounts SET status = 'stopped' WHERE id = ?
+                """, (account_id,))
+                await db.commit()
+            
+            await log_to_db(account_id, "INFO", f"Воркер аккаунта {account_id} остановлен")
+            return True
+        return False
+    
+    async def stop_all_workers(self):
+        """Остановка всех воркеров"""
+        account_ids = list(self.workers.keys())
+        for account_id in account_ids:
+            await self.stop_worker(account_id)
+
+# Глобальный менеджер воркеров
+worker_manager = WorkerManager()
 
 # ==================== ОБРАБОТЧИКИ: ИНИЦИАЛИЗАЦИЯ ====================
 
@@ -535,13 +644,22 @@ async def add_account_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AccountAuth.PHONE)
     await callback.answer()
 
+@router_accounts.message(Command("cancel"))
+async def cancel_auth(message: Message, state: FSMContext):
+    """Отмена авторизации"""
+    current_state = await state.get_state()
+    if current_state:
+        await state.clear()
+        await message.answer("❌ Операция отменена")
+        await show_main_menu(message)
+
 @router_accounts.message(AccountAuth.PHONE)
 async def process_phone(message: Message, state: FSMContext):
     """Обработка номера телефона"""
     phone = message.text.strip()
     
     if not phone.startswith('+') or not phone[1:].isdigit():
-        await message.answer("❌ Неверный формат. Пример: +79991234567")
+        await message.answer("❌ Неверный формат. Пример: +79991234567\n\nОтменить: /cancel")
         return
     
     config = await get_system_config()
@@ -562,12 +680,11 @@ async def process_phone(message: Message, state: FSMContext):
             encryption_key=config['encryption_key']
         )
         
-        await message.answer("🔐 Введите код из SMS\n\nКод придёт в Telegram или SMS")
+        await message.answer("🔐 Введите код из SMS\n\nКод придёт в Telegram или SMS\n\nОтменить: /cancel")
         await state.set_state(AccountAuth.CODE)
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {e}\n\nОтменить: /cancel")
         await client.disconnect()
-        await state.clear()
 
 @router_accounts.message(AccountAuth.CODE)
 async def process_code(message: Message, state: FSMContext):
@@ -581,21 +698,27 @@ async def process_code(message: Message, state: FSMContext):
     try:
         await client.sign_in(phone, code)
         
+        # Проверка авторизации
         if not await client.is_user_authorized():
-            await message.answer("🔒 Введите пароль двухфакторной аутентификации\n\nЕсли не помните, нажмите /cancel")
+            await message.answer("🔒 Введите пароль двухфакторной аутентификации\n\nОтменить: /cancel")
             await state.set_state(AccountAuth.PASSWORD)
             return
         
+        # Авторизация успешна
         await save_account_session(client, phone, data['encryption_key'])
         await message.answer(f"✅ Аккаунт {phone} успешно добавлен!")
         
         await client.disconnect()
         await state.clear()
         await show_main_menu(message)
+        
+    except SessionPasswordNeededError:
+        # Требуется 2FA пароль
+        await message.answer("🔒 Введите пароль двухфакторной аутентификации\n\nОтменить: /cancel")
+        await state.set_state(AccountAuth.PASSWORD)
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}\n\nПопробуйте ещё раз")
+        await message.answer(f"❌ Ошибка: {e}\n\nПопробуйте ещё раз или отменить: /cancel")
         await client.disconnect()
-        await state.clear()
 
 @router_accounts.message(AccountAuth.PASSWORD)
 async def process_2fa_password(message: Message, state: FSMContext):
@@ -615,9 +738,7 @@ async def process_2fa_password(message: Message, state: FSMContext):
         await state.clear()
         await show_main_menu(message)
     except Exception as e:
-        await message.answer(f"❌ Неверный пароль: {e}")
-        await client.disconnect()
-        await state.clear()
+        await message.answer(f"❌ Неверный пароль: {e}\n\nПопробуйте ещё раз или отменить: /cancel")
 
 async def save_account_session(client: TelegramClient, phone: str, encryption_key: str):
     """Сохранение сессии аккаунта в БД"""
@@ -658,7 +779,7 @@ async def accounts_list(callback: CallbackQuery):
             callback_data=f"account_detail_{acc_id}"
         )])
     
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")])
+    buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
     await callback.message.edit_text(text, reply_markup=keyboard)
@@ -684,10 +805,14 @@ async def account_detail(callback: CallbackQuery):
     phone, status, greeting, cd_search, cd_send, cd_skip, is_active, last_active, error = account
     status_ru = get_status_text_ru(status)
     
+    # Проверка, запущен ли воркер
+    is_running = account_id in worker_manager.workers
+    
     text = f"📱 АККАУНТ {account_id}\n\n"
     text += f"Номер: {phone}\n"
     text += f"Статус: {status_ru}\n"
-    text += f"Активен: {'Да' if is_active else 'Нет'}\n\n"
+    text += f"Активен: {'Да' if is_active else 'Нет'}\n"
+    text += f"Воркер: {'🟢 Запущен' if is_running else '⚫ Остановлен'}\n\n"
     text += f"📝 Текст приветствия:\n{greeting}\n\n"
     text += f"⏱ Задержки:\n"
     text += f"├ Поиск: {cd_search} сек\n"
@@ -700,18 +825,59 @@ async def account_detail(callback: CallbackQuery):
     if error:
         text += f"\n❌ Ошибка: {error}\n"
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_account_{account_id}")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="accounts_list")]
-    ])
+    # Кнопки управления
+    buttons = []
+    
+    if is_running:
+        buttons.append([InlineKeyboardButton(text="⏹ Остановить", callback_data=f"stop_worker_{account_id}")])
+    else:
+        buttons.append([InlineKeyboardButton(text="▶️ Запустить", callback_data=f"start_worker_{account_id}")])
+    
+    buttons.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_account_{account_id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="accounts_list")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
+
+@router_accounts.callback_query(F.data.startswith("start_worker_"))
+async def start_worker(callback: CallbackQuery):
+    """Запуск воркера аккаунта"""
+    account_id = int(callback.data.split("_")[2])
+    
+    success = await worker_manager.start_worker(account_id, callback.bot)
+    
+    if success:
+        await callback.answer("✅ Воркер запущен", show_alert=True)
+    else:
+        await callback.answer("❌ Не удалось запустить воркер", show_alert=True)
+    
+    # Обновить детали аккаунта
+    await account_detail(callback)
+
+@router_accounts.callback_query(F.data.startswith("stop_worker_"))
+async def stop_worker(callback: CallbackQuery):
+    """Остановка воркера аккаунта"""
+    account_id = int(callback.data.split("_")[2])
+    
+    success = await worker_manager.stop_worker(account_id)
+    
+    if success:
+        await callback.answer("✅ Воркер остановлен", show_alert=True)
+    else:
+        await callback.answer("❌ Воркер не был запущен", show_alert=True)
+    
+    # Обновить детали аккаунта
+    await account_detail(callback)
 
 @router_accounts.callback_query(F.data.startswith("delete_account_"))
 async def delete_account(callback: CallbackQuery):
     """Удаление аккаунта"""
     account_id = int(callback.data.split("_")[2])
+    
+    # Остановить воркер если запущен
+    await worker_manager.stop_worker(account_id)
     
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
@@ -743,7 +909,7 @@ async def set_texts_menu(callback: CallbackQuery):
         )])
     
     buttons.append([InlineKeyboardButton(text="📋 Посмотреть все", callback_data="view_all_texts")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")])
+    buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text("📝 Выберите аккаунт для настройки текста:", reply_markup=keyboard)
@@ -756,7 +922,8 @@ async def set_text_account(callback: CallbackQuery, state: FSMContext):
     
     await callback.message.edit_text(
         f"📝 Введите текст приветствия для Аккаунта {account_id}:\n\n"
-        "Этот текст будет отправляться каждому новому собеседнику."
+        "Этот текст будет отправляться каждому новому собеседнику.\n\n"
+        "Отменить: /cancel"
     )
     
     await state.update_data(account_id=account_id)
@@ -821,7 +988,7 @@ async def set_cooldowns_menu(callback: CallbackQuery):
             callback_data=f"set_cooldown_acc_{acc_id}"
         )])
     
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")])
+    buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text("⏱ Выберите аккаунт для настройки задержек:", reply_markup=keyboard)
@@ -850,7 +1017,8 @@ async def set_cooldown_account(callback: CallbackQuery, state: FSMContext):
         f"├ Перед отправкой: {cd_send} сек\n"
         f"└ После скипа: {cd_skip} сек\n\n"
         f"Введите новые значения через пробел:\n"
-        f"Пример: 25 5 20"
+        f"Пример: 25 5 20\n\n"
+        f"Отменить: /cancel"
     )
     
     await state.update_data(account_id=account_id)
@@ -866,13 +1034,13 @@ async def process_cooldown_values(message: Message, state: FSMContext):
     try:
         values = message.text.strip().split()
         if len(values) != 3:
-            await message.answer("❌ Нужно ввести 3 числа через пробел. Попробуйте ещё раз:")
+            await message.answer("❌ Нужно ввести 3 числа через пробел. Попробуйте ещё раз:\n\nОтменить: /cancel")
             return
         
         cd_search, cd_send, cd_skip = map(int, values)
         
         if any(v <= 0 for v in [cd_search, cd_send, cd_skip]):
-            await message.answer("❌ Все значения должны быть больше нуля. Попробуйте ещё раз:")
+            await message.answer("❌ Все значения должны быть больше нуля. Попробуйте ещё раз:\n\nОтменить: /cancel")
             return
         
         async with aiosqlite.connect(DB_PATH) as db:
@@ -892,7 +1060,7 @@ async def process_cooldown_values(message: Message, state: FSMContext):
         await state.clear()
         await show_main_menu(message)
     except ValueError:
-        await message.answer("❌ Неверный формат. Введите 3 числа через пробел:")
+        await message.answer("❌ Неверный формат. Введите 3 числа через пробел:\n\nОтменить: /cancel")
 
 # ==================== ОБРАБОТЧИКИ: УПРАВЛЕНИЕ ====================
 
@@ -901,23 +1069,26 @@ router_control = Router()
 @router_control.callback_query(F.data == "start_all")
 async def start_all_accounts(callback: CallbackQuery):
     """Запуск всех аккаунтов"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM accounts WHERE is_active = TRUE")
-        count = (await cursor.fetchone())[0]
+    accounts = await get_accounts_status()
     
-    if count == 0:
-        await callback.answer("❌ Нет активных аккаунтов", show_alert=True)
+    if not accounts:
+        await callback.answer("❌ Нет аккаунтов", show_alert=True)
         return
     
-    # TODO: Реализовать запуск воркеров
-    await callback.answer(f"▶️ Запущено {count} аккаунтов", show_alert=True)
-    await log_to_db(None, "INFO", f"Запущены все аккаунты ({count})")
+    started_count = 0
+    for acc_id, _, _, is_active in accounts:
+        if is_active and acc_id not in worker_manager.workers:
+            if await worker_manager.start_worker(acc_id, callback.bot):
+                started_count += 1
+    
+    await callback.answer(f"▶️ Запущено {started_count} аккаунтов", show_alert=True)
+    await log_to_db(None, "INFO", f"Запущены все аккаунты ({started_count})")
     await callback_main_menu(callback)
 
 @router_control.callback_query(F.data == "pause_all")
 async def pause_all_accounts(callback: CallbackQuery):
     """Пауза всех аккаунтов"""
-    # TODO: Реализовать паузу воркеров
+    # TODO: Реализовать паузу (не остановку, а временную приостановку)
     await callback.answer("⏸ Все аккаунты поставлены на паузу", show_alert=True)
     await log_to_db(None, "INFO", "Все аккаунты на паузе")
     await callback_main_menu(callback)
@@ -925,7 +1096,7 @@ async def pause_all_accounts(callback: CallbackQuery):
 @router_control.callback_query(F.data == "stop_all")
 async def stop_all_accounts(callback: CallbackQuery):
     """Остановка всех аккаунтов"""
-    # TODO: Реализовать остановку воркеров
+    await worker_manager.stop_all_workers()
     await callback.answer("⏹ Все аккаунты остановлены", show_alert=True)
     await log_to_db(None, "INFO", "Все аккаунты остановлены")
     await callback_main_menu(callback)
@@ -939,7 +1110,7 @@ async def messages_menu(callback: CallbackQuery):
     """Меню сообщений"""
     text = "📩 ВХОДЯЩИЕ СООБЩЕНИЯ\n\nФункция в разработке..."
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")]
     ])
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
@@ -974,7 +1145,7 @@ async def stats_menu(callback: CallbackQuery):
     text += f"└ Таймаутов: {total_timeouts}\n"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")]
     ])
     
     await callback.message.edit_text(text, reply_markup=keyboard)
@@ -1007,7 +1178,7 @@ async def logs_menu(callback: CallbackQuery):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💾 Скачать все логи", callback_data="download_logs")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")]
     ])
     
     await callback.message.edit_text(text, reply_markup=keyboard)
@@ -1100,6 +1271,7 @@ async def main():
         print("\n⚠️  Получен сигнал остановки")
     finally:
         print("\n🛑 Остановка бота...")
+        await worker_manager.stop_all_workers()
         await bot.session.close()
         print("✅ Бот остановлен")
 
