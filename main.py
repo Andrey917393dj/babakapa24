@@ -1,6 +1,6 @@
 """
-Telegram Multi-Account Automation Bot
-Полный рабочий код с логикой автоматизации
+Telegram Multi-Account Automation Bot v2.0
+Полностью улучшенная версия с исправлением всех критических проблем
 """
 
 import asyncio
@@ -8,8 +8,10 @@ import os
 import sys
 import base64
 import random
+import time
+import json
 from datetime import datetime
-from typing import Callable, Dict, Any, Awaitable
+from typing import Callable, Dict, Any, Awaitable, Optional
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
@@ -23,7 +25,7 @@ import aiosqlite
 from cryptography.fernet import Fernet
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 # ==================== КОНФИГУРАЦИЯ ====================
 
@@ -56,6 +58,12 @@ class TextSettings(StatesGroup):
 
 class CooldownSettings(StatesGroup):
     ENTER_VALUES = State()
+
+class TimeoutSettings(StatesGroup):
+    ENTER_TIMEOUT = State()
+
+class PatternSettings(StatesGroup):
+    EDIT_FIELD = State()
 
 class WorkerState:
     IDLE = "idle"
@@ -108,6 +116,7 @@ async def init_database(password: str):
                 cooldown_search INTEGER DEFAULT 20,
                 cooldown_send INTEGER DEFAULT 3,
                 cooldown_skip INTEGER DEFAULT 15,
+                timeout_reply INTEGER DEFAULT 90,
                 status TEXT DEFAULT 'idle',
                 is_active BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -115,6 +124,12 @@ async def init_database(password: str):
                 error_message TEXT
             )
         """)
+        
+        # Добавляем колонку timeout_reply если её нет
+        try:
+            await db.execute("ALTER TABLE accounts ADD COLUMN timeout_reply INTEGER DEFAULT 90")
+        except:
+            pass
         
         await db.execute("""
             CREATE TABLE IF NOT EXISTS dialogs (
@@ -125,6 +140,7 @@ async def init_database(password: str):
                 first_message TEXT,
                 content_type TEXT,
                 outcome TEXT,
+                response_time REAL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (account_id) REFERENCES accounts(id)
             )
@@ -152,6 +168,7 @@ async def init_database(password: str):
                 total_skips INTEGER DEFAULT 0,
                 total_replies INTEGER DEFAULT 0,
                 total_timeouts INTEGER DEFAULT 0,
+                avg_response_time REAL DEFAULT 0,
                 active_time_minutes INTEGER DEFAULT 0,
                 FOREIGN KEY (account_id) REFERENCES accounts(id),
                 UNIQUE(account_id, date)
@@ -164,11 +181,11 @@ async def init_database(password: str):
                 account_id INTEGER,
                 level TEXT,
                 message TEXT,
+                extra TEXT,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
-        # Таблица паттернов бота
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_patterns (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -179,7 +196,6 @@ async def init_database(password: str):
             )
         """)
         
-        # Вставка значений по умолчанию
         cursor = await db.execute("SELECT COUNT(*) FROM bot_patterns")
         count = (await cursor.fetchone())[0]
         
@@ -209,12 +225,14 @@ def get_status_text_ru(status: str) -> str:
     }
     return status_map.get(status, 'Неизвестно')
 
-async def log_to_db(account_id: int = None, level: str = "INFO", message: str = ""):
+async def log_to_db(account_id: int = None, level: str = "INFO", message: str = "", extra: dict = None):
+    """Структурированное логирование"""
     async with aiosqlite.connect(DB_PATH) as db:
+        extra_json = json.dumps(extra) if extra else None
         await db.execute("""
-            INSERT INTO logs (account_id, level, message, timestamp)
-            VALUES (?, ?, ?, ?)
-        """, (account_id, level, message, datetime.now()))
+            INSERT INTO logs (account_id, level, message, extra, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        """, (account_id, level, message, extra_json, datetime.now()))
         await db.commit()
 
 def encrypt_session(session_string: str, key: str) -> str:
@@ -274,28 +292,34 @@ async def check_authorization_middleware(
     event: Message | CallbackQuery,
     data: Dict[str, Any]
 ) -> Any:
-    state = data.get('state')
-    if state:
-        current_state = await state.get_state()
-        if current_state:
-            return await handler(event, data)
-    
     user_id = event.from_user.id
     is_init = await is_system_initialized()
     
+    # Для неинициализированной системы
     if not is_init:
-        if isinstance(event, Message) and event.text == "/start":
-            return await handler(event, data)
-        elif isinstance(event, CallbackQuery) and event.data.startswith("init_"):
+        state = data.get('state')
+        current_state = await state.get_state() if state else None
+        
+        # Разрешаем только состояния настройки
+        allowed_states = [
+            SystemSetup.PASSWORD,
+            SystemSetup.API_ID,
+            SystemSetup.API_HASH
+        ]
+        
+        if current_state in allowed_states or \
+           (isinstance(event, Message) and event.text == "/start") or \
+           (isinstance(event, CallbackQuery) and event.data.startswith("init_")):
             return await handler(event, data)
         else:
-            text = "⚠️ Система не настроена. Напишите /start"
+            text = "⚠️ Система не настроена. Завершите настройку или напишите /start"
             if isinstance(event, Message):
                 await event.answer(text)
             else:
                 await event.answer(text, show_alert=True)
             return
     
+    # Для инициализированной системы проверяем admin_id
     admin_id = await get_admin_id()
     if user_id != admin_id:
         text = "🚫 У вас нет доступа к этому боту."
@@ -331,37 +355,58 @@ def get_main_menu_keyboard(has_accounts: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⏱ Задержки", callback_data="set_cooldowns")
         ],
         [
-            InlineKeyboardButton(text="🔤 Паттерны бота", callback_data="set_patterns")
+            InlineKeyboardButton(text="⏰ Таймауты", callback_data="set_timeouts"),
+            InlineKeyboardButton(text="🔤 Паттерны", callback_data="set_patterns")
         ],
         [
-            InlineKeyboardButton(text="📩 Сообщения", callback_data="messages_menu"),
-            InlineKeyboardButton(text="📊 Статистика", callback_data="stats_menu")
-        ],
-        [InlineKeyboardButton(text="📄 Логи", callback_data="logs_menu")]
+            InlineKeyboardButton(text="📊 Статистика", callback_data="stats_menu"),
+            InlineKeyboardButton(text="📄 Логи", callback_data="logs_menu")
+        ]
     ])
 
 # ==================== ВОРКЕР ====================
 
 class AccountWorker:
     def __init__(self, account_id: int, client: TelegramClient, greeting: str, 
-                 cd_search: int, cd_send: int, cd_skip: int, bot: Bot, admin_id: int):
+                 cd_search: int, cd_send: int, cd_skip: int, timeout_reply: int,
+                 bot: Bot, admin_id: int):
         self.account_id = account_id
         self.client = client
         self.greeting = greeting
         self.cd_search = cd_search
         self.cd_send = cd_send
         self.cd_skip = cd_skip
+        self.timeout_reply = timeout_reply
         self.bot = bot
         self.admin_id = admin_id
         
         self.state = WorkerState.IDLE
         self.is_running = True
         self.timer_task = None
+        self._shutdown_event = asyncio.Event()
+        
+        # Метрики
+        self.metrics = {
+            'dialogs_started': 0,
+            'replies_received': 0,
+            'avg_response_time': 0,
+            'errors_count': 0,
+            'skips': 0,
+            'timeouts': 0
+        }
+        self.dialog_start_time = None
+        self.my_user_id = None
     
     async def start(self):
         try:
             await self.client.connect()
-            await log_to_db(self.account_id, "INFO", "Подключение установлено")
+            
+            # Получаем свой ID
+            me = await self.client.get_me()
+            self.my_user_id = me.id
+            
+            await log_to_db(self.account_id, "INFO", "Подключение установлено", 
+                          extra={'user_id': self.my_user_id})
             
             @self.client.on(events.NewMessage(chats=TARGET_BOT))
             async def message_handler(event):
@@ -369,53 +414,114 @@ class AccountWorker:
             
             await self.search_dialog()
             
+            # Graceful shutdown
             while self.is_running:
-                await asyncio.sleep(1)
-                
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=1.0
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    continue
+        
+        except asyncio.CancelledError:
+            await log_to_db(self.account_id, "WARNING", "Принудительная остановка")
         except Exception as e:
             await log_to_db(self.account_id, "ERROR", f"Критическая ошибка: {e}")
             await update_account_status(self.account_id, WorkerState.ERROR, str(e))
+            self.metrics['errors_count'] += 1
         finally:
             if self.client.is_connected():
-                await self.client.disconnect()
+                try:
+                    await asyncio.wait_for(
+                        self.client.disconnect(),
+                        timeout=5.0
+                    )
+                    await log_to_db(self.account_id, "INFO", "Отключение завершено")
+                except asyncio.TimeoutError:
+                    await log_to_db(self.account_id, "WARNING", "Таймаут отключения")
     
-    async def search_dialog(self):
+    async def search_dialog(self, retry_count=0):
         if not self.is_running or self.state == WorkerState.PAUSED:
             return
         
         self.state = WorkerState.SEARCHING
         await update_account_status(self.account_id, WorkerState.SEARCHING)
-        await log_to_db(self.account_id, "INFO", "🔍 Отправка /search")
+        await log_to_db(self.account_id, "INFO", "🔍 Начало поиска")
         
         delay = self.cd_search + random.randint(-5, 5)
         await asyncio.sleep(max(1, delay))
         
         try:
             await self.client.send_message(TARGET_BOT, '/search')
+            await log_to_db(self.account_id, "INFO", "📤 /search отправлен")
+        
+        except FloodWaitError as e:
+            wait_time = e.seconds
+            await log_to_db(self.account_id, "WARNING", 
+                          f"FloodWait: {wait_time} сек", 
+                          extra={'wait_seconds': wait_time})
+            await asyncio.sleep(wait_time)
+            await self.search_dialog(retry_count)
+        
         except Exception as e:
             await log_to_db(self.account_id, "ERROR", f"Ошибка /search: {e}")
+            self.metrics['errors_count'] += 1
+            
+            if retry_count < 3:
+                await log_to_db(self.account_id, "INFO", 
+                              f"Повтор через 10 сек (попытка {retry_count + 1}/3)")
+                await asyncio.sleep(10)
+                await self.search_dialog(retry_count + 1)
+            else:
+                self.state = WorkerState.ERROR
+                await update_account_status(self.account_id, WorkerState.ERROR, str(e))
     
     async def handle_message(self, event):
         text = event.message.message if event.message.message else ""
-        await log_to_db(self.account_id, "INFO", f"📨 Получено: {text[:50]}...")
+        sender = await event.message.get_sender()
         
-        # Получение паттернов из БД
+        # Игнорируем свои сообщения
+        if sender and sender.id == self.my_user_id:
+            return
+        
+        await log_to_db(self.account_id, "INFO", f"📨 Получено: {text[:50]}...",
+                       extra={'sender_id': sender.id if sender else None})
+        
+        # Получение паттернов
         patterns = await self.get_patterns()
         
-        # Проверка паттернов (в порядке приоритета)
+        # 1. НАИВЫСШИЙ ПРИОРИТЕТ: Системные сообщения
+        if any(p in text for p in patterns['system_messages']):
+            await log_to_db(self.account_id, "INFO", "Системное сообщение (игнор)")
+            return
+        
+        # 2. Уже в диалоге
+        if any(p in text for p in patterns['already_in_dialog']):
+            await log_to_db(self.account_id, "WARNING", "Уже в диалоге")
+            return
+        
+        # 3. Собеседник найден
         if any(p in text for p in patterns['partner_found']):
             await self.on_partner_found()
-        elif any(p in text for p in patterns['partner_skipped']):
+            return
+        
+        # 4. Собеседник скипнул
+        if any(p in text for p in patterns['partner_skipped']):
             await self.on_partner_skipped()
-        elif any(p in text for p in patterns['already_in_dialog']):
-            await log_to_db(self.account_id, "WARNING", "Уже в диалоге")
-        elif any(p in text for p in patterns['system_messages']):
-            # Системное сообщение (подписка на каналы и т.д.) - игнорируем
-            await log_to_db(self.account_id, "INFO", "Системное сообщение, игнорируем")
-        elif self.state == WorkerState.WAITING_REPLY:
-            # Это сообщение от собеседника (любое непустое сообщение)
-            if text.strip() or event.message.photo or event.message.sticker or event.message.voice:
-                await self.on_partner_replied(event.message)
+            return
+        
+        # 5. Ответ собеседника (ТОЛЬКО в состоянии ожидания)
+        if self.state == WorkerState.WAITING_REPLY:
+            # Проверяем, что это не бот и есть контент
+            if sender and not sender.bot:
+                if text.strip() or event.message.photo or event.message.sticker or event.message.voice:
+                    await self.on_partner_replied(event.message)
+                    return
+        
+        # 6. Неизвестное сообщение
+        await log_to_db(self.account_id, "WARNING", f"Неизвестное: {text[:50]}")
     
     async def get_patterns(self):
         """Получить паттерны из БД"""
@@ -431,7 +537,6 @@ class AccountWorker:
                     'system_messages': result[4].split('|||')
                 }
             else:
-                # Значения по умолчанию
                 return {
                     'partner_found': ['Нашёл собеседника!'],
                     'partner_skipped': ['🤚', 'завершил диалог'],
@@ -441,6 +546,9 @@ class AccountWorker:
     
     async def on_partner_found(self):
         self.state = WorkerState.IN_DIALOG
+        self.dialog_start_time = time.time()
+        self.metrics['dialogs_started'] += 1
+        
         await update_account_status(self.account_id, WorkerState.IN_DIALOG)
         await log_to_db(self.account_id, "INFO", "✅ Собеседник найден")
         
@@ -458,10 +566,16 @@ class AccountWorker:
                 self.timer_task.cancel()
             self.timer_task = asyncio.create_task(self.inactivity_timer())
             
+        except FloodWaitError as e:
+            await log_to_db(self.account_id, "WARNING", 
+                          f"FloodWait при отправке: {e.seconds} сек")
+            await asyncio.sleep(e.seconds)
         except Exception as e:
             await log_to_db(self.account_id, "ERROR", f"Ошибка отправки: {e}")
+            self.metrics['errors_count'] += 1
     
     async def on_partner_skipped(self):
+        self.metrics['skips'] += 1
         await log_to_db(self.account_id, "INFO", "⏭ Собеседник скипнул")
         
         if self.timer_task:
@@ -475,6 +589,19 @@ class AccountWorker:
         if self.timer_task:
             self.timer_task.cancel()
         
+        # Вычисляем время ответа
+        response_time = None
+        if self.dialog_start_time:
+            response_time = time.time() - self.dialog_start_time
+            
+            # Обновляем среднее время
+            n = self.metrics['replies_received']
+            old_avg = self.metrics['avg_response_time']
+            self.metrics['avg_response_time'] = (old_avg * n + response_time) / (n + 1)
+        
+        self.metrics['replies_received'] += 1
+        
+        # Определяем тип контента
         if message.text:
             content_type = "текст"
             content = message.text
@@ -495,43 +622,55 @@ class AccountWorker:
         username = sender.username if sender and sender.username else "Нет username"
         user_id = sender.id if sender else 0
         
-        await log_to_db(self.account_id, "INFO", f"📩 Ответ: {content_type}")
+        await log_to_db(self.account_id, "INFO", f"📩 Ответ: {content_type}",
+                       extra={
+                           'username': username,
+                           'user_id': user_id,
+                           'content_type': content_type,
+                           'response_time': response_time
+                       })
         
+        # Сохраняем в БД
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
-                INSERT INTO dialogs (account_id, username, user_id, first_message, content_type, outcome)
-                VALUES (?, ?, ?, ?, ?, 'replied')
-            """, (self.account_id, username, user_id, content, content_type))
+                INSERT INTO dialogs (account_id, username, user_id, first_message, content_type, outcome, response_time)
+                VALUES (?, ?, ?, ?, ?, 'replied', ?)
+            """, (self.account_id, username, user_id, content, content_type, response_time))
             await db.commit()
         
-        # НЕ останавливаем воркер, просто уведомляем
-        await self.notify_admin_reply(username, user_id, content, content_type)
+        # Уведомляем админа
+        await self.notify_admin_reply(username, user_id, content, content_type, response_time)
         
         # Продолжаем ждать (может быть ещё сообщения)
-        # Таймер уже отменён, запускаем новый
         if self.state == WorkerState.WAITING_REPLY:
             self.timer_task = asyncio.create_task(self.inactivity_timer())
     
     async def inactivity_timer(self):
         try:
-            await asyncio.sleep(90)
+            await asyncio.sleep(self.timeout_reply)
             
             if self.state == WorkerState.WAITING_REPLY:
-                await log_to_db(self.account_id, "WARNING", "⏰ Таймаут 1.5 мин")
+                self.metrics['timeouts'] += 1
+                await log_to_db(self.account_id, "WARNING", 
+                              f"⏰ Таймаут {self.timeout_reply} сек")
                 self.state = WorkerState.PAUSED
                 await update_account_status(self.account_id, WorkerState.PAUSED)
                 await self.notify_admin_timeout()
         except asyncio.CancelledError:
             pass
     
-    async def notify_admin_reply(self, username: str, user_id: int, content: str, content_type: str):
+    async def notify_admin_reply(self, username: str, user_id: int, content: str, 
+                                content_type: str, response_time: Optional[float]):
+        time_str = f"{response_time:.1f} сек" if response_time else "N/A"
+        
         text = f"""
 💬 Аккаунт {self.account_id}: Собеседник ответил!
 
 👤 Username: @{username}
 🆔 User ID: {user_id}
 💬 Тип: {content_type}
-📝 Сообщение: {content}
+📝 Сообщение: {content[:100]}
+⏱ Время ответа: {time_str}
 ⏰ Время: {datetime.now().strftime('%H:%M:%S')}
 
 ⚠️ Бот продолжает работать
@@ -550,7 +689,7 @@ class AccountWorker:
     
     async def notify_admin_timeout(self):
         text = f"""
-⏰ Аккаунт {self.account_id}: Нет активности 1.5 минуты
+⏰ Аккаунт {self.account_id}: Таймаут {self.timeout_reply} сек
 
 Собеседник не ответил. Что делать?
 """
@@ -575,6 +714,7 @@ class AccountWorker:
             await self.search_dialog()
         except Exception as e:
             await log_to_db(self.account_id, "ERROR", f"Ошибка /next: {e}")
+            self.metrics['errors_count'] += 1
     
     async def wait_more(self):
         self.state = WorkerState.WAITING_REPLY
@@ -601,62 +741,105 @@ class AccountWorker:
         await update_account_status(self.account_id, WorkerState.STOPPED)
         if self.timer_task:
             self.timer_task.cancel()
+        self._shutdown_event.set()
 
 # ==================== МЕНЕДЖЕР ВОРКЕРОВ ====================
 
 class WorkerManager:
     def __init__(self):
-        self.workers = {}
+        self.workers: Dict[int, tuple[AccountWorker, asyncio.Task]] = {}
+        self._locks: Dict[int, asyncio.Lock] = {}
     
-    async def start_worker(self, account_id: int, bot: Bot):
-        if account_id in self.workers:
-            return False
-        
-        config = await get_system_config()
-        admin_id = await get_admin_id()
-        if not config or not admin_id:
-            return False
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("""
-                SELECT phone, session_data, greeting_text, cooldown_search, cooldown_send, cooldown_skip
-                FROM accounts WHERE id = ?
-            """, (account_id,))
-            account = await cursor.fetchone()
-        
-        if not account:
-            return False
-        
-        phone, encrypted_session, greeting, cd_search, cd_send, cd_skip = account
-        session_string = decrypt_session(encrypted_session, config['encryption_key'])
-        
-        client = TelegramClient(
-            StringSession(session_string),
-            config['api_id'],
-            config['api_hash']
-        )
-        
-        worker = AccountWorker(account_id, client, greeting, cd_search, cd_send, cd_skip, bot, admin_id)
-        task = asyncio.create_task(worker.start())
-        
-        self.workers[account_id] = (worker, task)
-        await log_to_db(account_id, "INFO", f"Воркер запущен")
-        return True
+    def _get_lock(self, account_id: int) -> asyncio.Lock:
+        """Получить lock для аккаунта (thread-safe)"""
+        if account_id not in self._locks:
+            self._locks[account_id] = asyncio.Lock()
+        return self._locks[account_id]
     
-    async def stop_worker(self, account_id: int):
-        if account_id in self.workers:
-            worker, task = self.workers[account_id]
-            await worker.stop()
-            task.cancel()
-            del self.workers[account_id]
-            await log_to_db(account_id, "INFO", f"Воркер остановлен")
-            return True
-        return False
+    async def start_worker(self, account_id: int, bot: Bot) -> bool:
+        client = None
+        try:
+            async with self._get_lock(account_id):
+                if account_id in self.workers:
+                    return False
+                
+                config = await get_system_config()
+                admin_id = await get_admin_id()
+                if not config or not admin_id:
+                    return False
+                
+                async with aiosqlite.connect(DB_PATH) as db:
+                    cursor = await db.execute("""
+                        SELECT phone, session_data, greeting_text, cooldown_search, 
+                               cooldown_send, cooldown_skip, timeout_reply
+                        FROM accounts WHERE id = ?
+                    """, (account_id,))
+                    account = await cursor.fetchone()
+                
+                if not account:
+                    return False
+                
+                phone, encrypted_session, greeting, cd_search, cd_send, cd_skip, timeout_reply = account
+                session_string = decrypt_session(encrypted_session, config['encryption_key'])
+                
+                client = TelegramClient(
+                    StringSession(session_string),
+                    config['api_id'],
+                    config['api_hash']
+                )
+                
+                # Подключаемся сразу для проверки
+                await client.connect()
+                
+                worker = AccountWorker(
+                    account_id, client, greeting, cd_search, cd_send, cd_skip, 
+                    timeout_reply, bot, admin_id
+                )
+                task = asyncio.create_task(worker.start())
+                
+                self.workers[account_id] = (worker, task)
+                await log_to_db(account_id, "INFO", "Воркер запущен")
+                return True
+        
+        except Exception as e:
+            if client and client.is_connected():
+                await client.disconnect()
+            await log_to_db(account_id, "ERROR", f"Ошибка запуска воркера: {e}")
+            return False
     
-    async def get_worker(self, account_id: int):
+    async def stop_worker(self, account_id: int) -> bool:
+        async with self._get_lock(account_id):
+            if account_id in self.workers:
+                worker, task = self.workers[account_id]
+                await worker.stop()
+                
+                try:
+                    await asyncio.wait_for(task, timeout=10.0)
+                except asyncio.TimeoutError:
+                    task.cancel()
+                    await log_to_db(account_id, "WARNING", "Принудительная остановка по таймауту")
+                
+                del self.workers[account_id]
+                await log_to_db(account_id, "INFO", "Воркер остановлен")
+                return True
+            return False
+    
+    async def get_worker(self, account_id: int) -> Optional[AccountWorker]:
         if account_id in self.workers:
             return self.workers[account_id][0]
         return None
+    
+    async def pause_all_workers(self):
+        for account_id in list(self.workers.keys()):
+            worker = await self.get_worker(account_id)
+            if worker:
+                await worker.pause()
+    
+    async def resume_all_workers(self):
+        for account_id in list(self.workers.keys()):
+            worker = await self.get_worker(account_id)
+            if worker and worker.state == WorkerState.PAUSED:
+                await worker.resume()
     
     async def stop_all_workers(self):
         account_ids = list(self.workers.keys())
@@ -672,11 +855,10 @@ router_start = Router()
 router_accounts = Router()
 router_settings = Router()
 router_control = Router()
-router_messages = Router()
 router_stats = Router()
 router_logs = Router()
 
-# ИНИЦИАЛИЗАЦИЯ
+# ==================== ИНИЦИАЛИЗАЦИЯ ====================
 
 @router_init.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -775,7 +957,7 @@ async def process_api_hash(message: Message, state: FSMContext):
     await message.answer("Что дальше?", reply_markup=keyboard)
     await state.clear()
 
-# ГЛАВНОЕ МЕНЮ
+# ==================== ГЛАВНОЕ МЕНЮ ====================
 
 async def get_accounts_status():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -805,7 +987,7 @@ async def callback_main_menu(callback: CallbackQuery):
     await show_main_menu(callback.message)
     await callback.answer()
 
-# АККАУНТЫ
+# ==================== АККАУНТЫ ====================
 
 @router_accounts.callback_query(F.data == "add_account")
 async def add_account_start(callback: CallbackQuery, state: FSMContext):
@@ -902,7 +1084,8 @@ async def save_account_session(client: TelegramClient, phone: str, encryption_ke
     encrypted_session = encrypt_session(session_string, encryption_key)
     
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO accounts (phone, session_data) VALUES (?, ?)", (phone, encrypted_session))
+        await db.execute("INSERT INTO accounts (phone, session_data) VALUES (?, ?)", 
+                        (phone, encrypted_session))
         await db.commit()
     
     await log_to_db(None, "INFO", f"Добавлен аккаунт: {phone}")
@@ -924,7 +1107,8 @@ async def accounts_list(callback: CallbackQuery):
         phone_masked = f"{phone[:4]}***{phone[-3:]}"
         text += f"{emoji} Аккаунт {acc_id}\n   Номер: {phone_masked}\n   Статус: {status_ru}\n\n"
         
-        buttons.append([InlineKeyboardButton(text=f"{emoji} Аккаунт {acc_id}", callback_data=f"account_detail_{acc_id}")])
+        buttons.append([InlineKeyboardButton(text=f"{emoji} Аккаунт {acc_id}", 
+                                            callback_data=f"account_detail_{acc_id}")])
     
     buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -938,8 +1122,8 @@ async def account_detail(callback: CallbackQuery):
     
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
-            SELECT phone, status, greeting_text, cooldown_search, cooldown_send, cooldown_skip, 
-                   is_active, last_active, error_message
+            SELECT phone, status, greeting_text, cooldown_search, cooldown_send, 
+                   cooldown_skip, timeout_reply, is_active, last_active, error_message
             FROM accounts WHERE id = ?
         """, (account_id,))
         account = await cursor.fetchone()
@@ -948,7 +1132,7 @@ async def account_detail(callback: CallbackQuery):
         await callback.answer("❌ Аккаунт не найден", show_alert=True)
         return
     
-    phone, status, greeting, cd_search, cd_send, cd_skip, is_active, last_active, error = account
+    phone, status, greeting, cd_search, cd_send, cd_skip, timeout_reply, is_active, last_active, error = account
     status_ru = get_status_text_ru(status)
     is_running = account_id in worker_manager.workers
     
@@ -957,18 +1141,22 @@ async def account_detail(callback: CallbackQuery):
     text += f"Статус: {status_ru}\n"
     text += f"Воркер: {'🟢 Запущен' if is_running else '⚫ Остановлен'}\n\n"
     text += f"📝 Текст: {greeting}\n\n"
-    text += f"⏱ Задержки:\n├ Поиск: {cd_search} сек\n├ Отправка: {cd_send} сек\n└ Скип: {cd_skip} сек\n"
+    text += f"⏱ Задержки:\n├ Поиск: {cd_search} сек\n├ Отправка: {cd_send} сек\n└ Скип: {cd_skip} сек\n\n"
+    text += f"⏰ Таймаут ответа: {timeout_reply} сек\n"
     
     if error:
         text += f"\n❌ Ошибка: {error}\n"
     
     buttons = []
     if is_running:
-        buttons.append([InlineKeyboardButton(text="⏹ Остановить", callback_data=f"stop_worker_{account_id}")])
+        buttons.append([InlineKeyboardButton(text="⏹ Остановить", 
+                                            callback_data=f"stop_worker_{account_id}")])
     else:
-        buttons.append([InlineKeyboardButton(text="▶️ Запустить", callback_data=f"start_worker_{account_id}")])
+        buttons.append([InlineKeyboardButton(text="▶️ Запустить", 
+                                            callback_data=f"start_worker_{account_id}")])
     
-    buttons.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_account_{account_id}")])
+    buttons.append([InlineKeyboardButton(text="🗑 Удалить", 
+                                        callback_data=f"delete_account_{account_id}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="accounts_list")])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1008,11 +1196,11 @@ async def delete_account(callback: CallbackQuery):
         await db.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
         await db.commit()
     
-    await log_to_db(account_id, "INFO", f"Аккаунт удалён")
+    await log_to_db(account_id, "INFO", "Аккаунт удалён")
     await callback.answer("✅ Аккаунт удалён", show_alert=True)
     await accounts_list(callback)
 
-# НАСТРОЙКИ
+# ==================== НАСТРОЙКИ ТЕКСТОВ ====================
 
 @router_settings.callback_query(F.data == "set_texts")
 async def set_texts_menu(callback: CallbackQuery):
@@ -1025,7 +1213,8 @@ async def set_texts_menu(callback: CallbackQuery):
     buttons = []
     for acc_id, phone, _, _ in accounts:
         phone_masked = f"{phone[:4]}***{phone[-3:]}"
-        buttons.append([InlineKeyboardButton(text=f"Аккаунт {acc_id} ({phone_masked})", callback_data=f"set_text_acc_{acc_id}")])
+        buttons.append([InlineKeyboardButton(text=f"Аккаунт {acc_id} ({phone_masked})", 
+                                            callback_data=f"set_text_acc_{acc_id}")])
     
     buttons.append([InlineKeyboardButton(text="📋 Посмотреть все", callback_data="view_all_texts")])
     buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
@@ -1050,7 +1239,8 @@ async def process_greeting_text(message: Message, state: FSMContext):
     greeting_text = message.text
     
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE accounts SET greeting_text = ? WHERE id = ?", (greeting_text, account_id))
+        await db.execute("UPDATE accounts SET greeting_text = ? WHERE id = ?", 
+                        (greeting_text, account_id))
         await db.commit()
     
     await message.answer(f"✅ Текст для Аккаунта {account_id} сохранён!")
@@ -1072,9 +1262,13 @@ async def view_all_texts(callback: CallbackQuery):
         phone_masked = f"{phone[:4]}***{phone[-3:]}"
         text += f"Аккаунт {acc_id} ({phone_masked}):\n└ {greeting}\n\n"
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="set_texts")]])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="set_texts")]
+    ])
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
+
+# ==================== НАСТРОЙКИ ЗАДЕРЖЕК ====================
 
 @router_settings.callback_query(F.data == "set_cooldowns")
 async def set_cooldowns_menu(callback: CallbackQuery):
@@ -1087,7 +1281,8 @@ async def set_cooldowns_menu(callback: CallbackQuery):
     buttons = []
     for acc_id, phone, _, _ in accounts:
         phone_masked = f"{phone[:4]}***{phone[-3:]}"
-        buttons.append([InlineKeyboardButton(text=f"Аккаунт {acc_id} ({phone_masked})", callback_data=f"set_cooldown_acc_{acc_id}")])
+        buttons.append([InlineKeyboardButton(text=f"Аккаунт {acc_id} ({phone_masked})", 
+                                            callback_data=f"set_cooldown_acc_{acc_id}")])
     
     buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
     
@@ -1100,7 +1295,10 @@ async def set_cooldown_account(callback: CallbackQuery, state: FSMContext):
     account_id = int(callback.data.split("_")[3])
     
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT cooldown_search, cooldown_send, cooldown_skip FROM accounts WHERE id = ?", (account_id,))
+        cursor = await db.execute("""
+            SELECT cooldown_search, cooldown_send, cooldown_skip 
+            FROM accounts WHERE id = ?
+        """, (account_id,))
         result = await cursor.fetchone()
     
     if not result:
@@ -1153,19 +1351,107 @@ async def process_cooldown_values(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Неверный формат")
 
-# ПАТТЕРНЫ
+# ==================== НАСТРОЙКИ ТАЙМАУТОВ ====================
 
-class PatternSettings(StatesGroup):
-    EDIT_FIELD = State()
+@router_settings.callback_query(F.data == "set_timeouts")
+async def set_timeouts_menu(callback: CallbackQuery):
+    accounts = await get_accounts_status()
+    
+    if not accounts:
+        await callback.answer("❌ Добавьте аккаунты", show_alert=True)
+        return
+    
+    buttons = []
+    for acc_id, phone, _, _ in accounts:
+        phone_masked = f"{phone[:4]}***{phone[-3:]}"
+        buttons.append([InlineKeyboardButton(text=f"Аккаунт {acc_id} ({phone_masked})", 
+                                            callback_data=f"set_timeout_acc_{acc_id}")])
+    
+    buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await callback.message.edit_text("⏰ Выберите аккаунт:", reply_markup=keyboard)
+    await callback.answer()
+
+@router_settings.callback_query(F.data.startswith("set_timeout_acc_"))
+async def set_timeout_account(callback: CallbackQuery, state: FSMContext):
+    account_id = int(callback.data.split("_")[3])
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT timeout_reply FROM accounts WHERE id = ?
+        """, (account_id,))
+        result = await cursor.fetchone()
+    
+    if not result:
+        await callback.answer("❌ Аккаунт не найден", show_alert=True)
+        return
+    
+    timeout_reply = result[0]
+    
+    await callback.message.edit_text(
+        f"⏰ Текущий таймаут ожидания ответа:\n"
+        f"Аккаунт {account_id}: {timeout_reply} секунд\n\n"
+        f"Введите новое значение в секундах:\n"
+        f"Пример: 120 (для 2 минут)\n\n"
+        f"Рекомендуемые значения:\n"
+        f"├ 60 сек (1 минута)\n"
+        f"├ 90 сек (1.5 минуты) - по умолчанию\n"
+        f"├ 120 сек (2 минуты)\n"
+        f"└ 180 сек (3 минуты)\n\n"
+        f"Отменить: /cancel"
+    )
+    
+    await state.update_data(account_id=account_id)
+    await state.set_state(TimeoutSettings.ENTER_TIMEOUT)
+    await callback.answer()
+
+@router_settings.message(TimeoutSettings.ENTER_TIMEOUT)
+async def process_timeout_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    account_id = data['account_id']
+    
+    try:
+        timeout_value = int(message.text.strip())
+        
+        if timeout_value < 30:
+            await message.answer("❌ Минимальное значение: 30 секунд")
+            return
+        
+        if timeout_value > 600:
+            await message.answer("❌ Максимальное значение: 600 секунд (10 минут)")
+            return
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE accounts 
+                SET timeout_reply = ?
+                WHERE id = ?
+            """, (timeout_value, account_id))
+            await db.commit()
+        
+        await message.answer(
+            f"✅ Таймаут для Аккаунта {account_id} обновлён!\n\n"
+            f"Новое значение: {timeout_value} секунд ({timeout_value // 60} мин {timeout_value % 60} сек)\n\n"
+            f"⚠️ Перезапустите воркер, чтобы изменения вступили в силу."
+        )
+        await state.clear()
+        await show_main_menu(message)
+    except ValueError:
+        await message.answer("❌ Введите целое число")
+
+# ==================== НАСТРОЙКИ ПАТТЕРНОВ ====================
 
 @router_settings.callback_query(F.data == "set_patterns")
 async def patterns_menu(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT partner_found, partner_skipped, already_in_dialog, system_messages FROM bot_patterns WHERE id = 1")
+        cursor = await db.execute("""
+            SELECT partner_found, partner_skipped, already_in_dialog, system_messages 
+            FROM bot_patterns WHERE id = 1
+        """)
         result = await cursor.fetchone()
     
     if not result:
-        # Создаём запись по умолчанию
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
                 INSERT INTO bot_patterns (id, partner_found, partner_skipped, already_in_dialog, system_messages)
@@ -1242,11 +1528,11 @@ async def process_pattern(message: Message, state: FSMContext):
         """, (value,))
         await db.commit()
     
-    await message.answer(f"✅ Паттерн обновлён!")
+    await message.answer("✅ Паттерн обновлён!")
     await state.clear()
     await show_main_menu(message)
 
-# УПРАВЛЕНИЕ
+# ==================== УПРАВЛЕНИЕ ====================
 
 @router_control.callback_query(F.data == "start_all")
 async def start_all_accounts(callback: CallbackQuery):
@@ -1266,6 +1552,13 @@ async def start_all_accounts(callback: CallbackQuery):
     await log_to_db(None, "INFO", f"Запущены все ({started_count})")
     await callback_main_menu(callback)
 
+@router_control.callback_query(F.data == "pause_all")
+async def pause_all_accounts(callback: CallbackQuery):
+    await worker_manager.pause_all_workers()
+    await callback.answer("⏸ Все на паузе", show_alert=True)
+    await log_to_db(None, "INFO", "Все на паузе")
+    await callback_main_menu(callback)
+
 @router_control.callback_query(F.data == "stop_all")
 async def stop_all_accounts(callback: CallbackQuery):
     await worker_manager.stop_all_workers()
@@ -1273,25 +1566,18 @@ async def stop_all_accounts(callback: CallbackQuery):
     await log_to_db(None, "INFO", "Все остановлены")
     await callback_main_menu(callback)
 
-# ВОРКЕР КОНТРОЛЬ
-
-# ВОРКЕР КОНТРОЛЬ
-
 @router_control.callback_query(F.data.startswith("worker_stop_dialog_"))
 async def worker_stop_dialog(callback: CallbackQuery):
-    """Остановить текущий диалог и поставить воркер на паузу"""
     account_id = int(callback.data.split("_")[3])
     worker = await worker_manager.get_worker(account_id)
     
     if worker:
-        # Отправляем /stop в бот
         try:
             await worker.client.send_message(TARGET_BOT, '/stop')
             await log_to_db(account_id, "INFO", "Отправлен /stop")
         except Exception as e:
             await log_to_db(account_id, "ERROR", f"Ошибка /stop: {e}")
         
-        # Ставим на паузу
         await worker.pause()
         await callback.answer("✅ Диалог остановлен, воркер на паузе", show_alert=True)
     else:
@@ -1325,13 +1611,14 @@ async def worker_wait(callback: CallbackQuery):
     
     await callback.message.delete()
 
-# СТАТИСТИКА
+# ==================== СТАТИСТИКА ====================
 
 @router_stats.callback_query(F.data == "stats_menu")
 async def stats_menu(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
-            SELECT SUM(total_dialogs), SUM(total_skips), SUM(total_replies), SUM(total_timeouts)
+            SELECT SUM(total_dialogs), SUM(total_skips), SUM(total_replies), 
+                   SUM(total_timeouts), AVG(avg_response_time)
             FROM stats
         """)
         result = await cursor.fetchone()
@@ -1340,19 +1627,67 @@ async def stats_menu(callback: CallbackQuery):
     total_skips = result[1] or 0
     total_replies = result[2] or 0
     total_timeouts = result[3] or 0
+    avg_response = result[4] or 0
     
-    text = f"📊 СТАТИСТИКА\n\nВсего диалогов: {total_dialogs}\n├ Скипов: {total_skips}\n├ Ответов: {total_replies}\n└ Таймаутов: {total_timeouts}\n"
+    # Живые метрики из активных воркеров
+    live_metrics = {
+        'dialogs': 0,
+        'replies': 0,
+        'skips': 0,
+        'timeouts': 0,
+        'avg_time': 0
+    }
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")]])
+    active_workers = 0
+    for acc_id in worker_manager.workers:
+        worker = await worker_manager.get_worker(acc_id)
+        if worker:
+            active_workers += 1
+            live_metrics['dialogs'] += worker.metrics['dialogs_started']
+            live_metrics['replies'] += worker.metrics['replies_received']
+            live_metrics['skips'] += worker.metrics['skips']
+            live_metrics['timeouts'] += worker.metrics['timeouts']
+            if worker.metrics['avg_response_time'] > 0:
+                live_metrics['avg_time'] += worker.metrics['avg_response_time']
+    
+    if active_workers > 0:
+        live_metrics['avg_time'] /= active_workers
+    
+    text = f"""
+📊 СТАТИСТИКА
+
+📈 Всего за всё время:
+├ Диалогов: {total_dialogs}
+├ Скипов: {total_skips}
+├ Ответов: {total_replies}
+├ Таймаутов: {total_timeouts}
+└ Средний ответ: {avg_response:.1f} сек
+
+🔴 Текущая сессия ({active_workers} активных):
+├ Диалогов: {live_metrics['dialogs']}
+├ Скипов: {live_metrics['skips']}
+├ Ответов: {live_metrics['replies']}
+├ Таймаутов: {live_metrics['timeouts']}
+└ Средний ответ: {live_metrics['avg_time']:.1f} сек
+"""
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")]
+    ])
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
-# ЛОГИ
+# ==================== ЛОГИ ====================
 
 @router_logs.callback_query(F.data == "logs_menu")
 async def logs_menu(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT level, message, timestamp FROM logs ORDER BY timestamp DESC LIMIT 10")
+        cursor = await db.execute("""
+            SELECT level, message, timestamp 
+            FROM logs 
+            ORDER BY timestamp DESC 
+            LIMIT 10
+        """)
         logs = await cursor.fetchall()
     
     if not logs:
@@ -1365,7 +1700,7 @@ async def logs_menu(callback: CallbackQuery):
             text += f"{emoji} [{time_str}] {message}\n"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💾 Скачать", callback_data="download_logs")],
+        [InlineKeyboardButton(text="💾 Скачать полные логи", callback_data="download_logs")],
         [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")]
     ])
     
@@ -1375,18 +1710,24 @@ async def logs_menu(callback: CallbackQuery):
 @router_logs.callback_query(F.data == "download_logs")
 async def download_logs(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT account_id, level, message, timestamp FROM logs ORDER BY timestamp DESC")
+        cursor = await db.execute("""
+            SELECT account_id, level, message, extra, timestamp 
+            FROM logs 
+            ORDER BY timestamp DESC
+        """)
         logs = await cursor.fetchall()
     
     if not logs:
         await callback.answer("❌ Логов нет", show_alert=True)
         return
     
-    log_content = "TELEGRAM AUTOMATION BOT - LOGS\n" + "=" * 60 + "\n\n"
+    log_content = "TELEGRAM AUTOMATION BOT v2.0 - LOGS\n" + "=" * 60 + "\n\n"
     
-    for account_id, level, message, timestamp in logs:
+    for account_id, level, message, extra, timestamp in logs:
         acc_str = f"ACC_{account_id}" if account_id else "SYSTEM"
         log_content += f"[{timestamp}] [{acc_str}] [{level}] {message}\n"
+        if extra:
+            log_content += f"  Extra: {extra}\n"
     
     log_file_path = "logs/bot_logs.txt"
     os.makedirs('logs', exist_ok=True)
@@ -1398,30 +1739,32 @@ async def download_logs(callback: CallbackQuery):
     await callback.message.answer_document(log_file, caption="📄 Полные логи")
     await callback.answer("✅ Логи отправлены")
 
-# ГЛАВНАЯ ФУНКЦИЯ
+# ==================== ГЛАВНАЯ ФУНКЦИЯ ====================
 
 async def main():
     print("=" * 60)
-    print("🚀 Запуск Telegram Automation Bot")
+    print("🚀 Запуск Telegram Automation Bot v2.0")
     print("=" * 60)
     
     print("📦 Инициализация БД...")
     await init_database(PASSWORD)
+    print("✅ БД готова")
     print("=" * 60)
     
     bot = Bot(token=TOKEN)
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
     
+    # Подключаем все роутеры
     dp.include_router(router_init)
     dp.include_router(router_start)
     dp.include_router(router_accounts)
     dp.include_router(router_settings)
     dp.include_router(router_control)
-    dp.include_router(router_messages)
     dp.include_router(router_stats)
     dp.include_router(router_logs)
     
+    # Подключаем middleware
     dp.message.middleware(check_authorization_middleware)
     dp.callback_query.middleware(check_authorization_middleware)
     
@@ -1429,18 +1772,19 @@ async def main():
     print(f"🤖 Бот: @{bot_info.username}")
     print(f"🆔 Bot ID: {bot_info.id}")
     print("=" * 60)
-    print("✅ Бот запущен!")
+    print("✅ Бот запущен и готов к работе!")
+    print("📱 Отправьте /start боту для начала работы")
     print("=" * 60)
     
     try:
         await dp.start_polling(bot)
     except KeyboardInterrupt:
-        print("\n⚠️  Остановка...")
+        print("\n⚠️  Получен сигнал остановки...")
     finally:
-        print("\n🛑 Остановка воркеров...")
+        print("\n🛑 Остановка всех воркеров...")
         await worker_manager.stop_all_workers()
         await bot.session.close()
-        print("✅ Бот остановлен")
+        print("✅ Бот полностью остановлен")
 
 if __name__ == '__main__':
     try:
