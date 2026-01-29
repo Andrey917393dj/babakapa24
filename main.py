@@ -168,6 +168,27 @@ async def init_database(password: str):
             )
         """)
         
+        # Таблица паттернов бота
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_patterns (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                partner_found TEXT DEFAULT 'Нашёл собеседника!',
+                partner_skipped TEXT DEFAULT '🤚|||завершил диалог',
+                already_in_dialog TEXT DEFAULT '🔴|||недоступна в диалоге',
+                system_messages TEXT DEFAULT '🛑 Подпишись|||оставить отзыв'
+            )
+        """)
+        
+        # Вставка значений по умолчанию
+        cursor = await db.execute("SELECT COUNT(*) FROM bot_patterns")
+        count = (await cursor.fetchone())[0]
+        
+        if count == 0:
+            await db.execute("""
+                INSERT INTO bot_patterns (id, partner_found, partner_skipped, already_in_dialog, system_messages)
+                VALUES (1, 'Нашёл собеседника!', '🤚|||завершил диалог', '🔴|||недоступна в диалоге', '🛑 Подпишись|||оставить отзыв')
+            """)
+        
         await db.commit()
 
 # ==================== УТИЛИТЫ ====================
@@ -310,6 +331,9 @@ def get_main_menu_keyboard(has_accounts: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⏱ Задержки", callback_data="set_cooldowns")
         ],
         [
+            InlineKeyboardButton(text="🔤 Паттерны бота", callback_data="set_patterns")
+        ],
+        [
             InlineKeyboardButton(text="📩 Сообщения", callback_data="messages_menu"),
             InlineKeyboardButton(text="📊 Статистика", callback_data="stats_menu")
         ],
@@ -372,17 +396,48 @@ class AccountWorker:
             await log_to_db(self.account_id, "ERROR", f"Ошибка /search: {e}")
     
     async def handle_message(self, event):
-        text = event.message.message
+        text = event.message.message if event.message.message else ""
         await log_to_db(self.account_id, "INFO", f"📨 Получено: {text[:50]}...")
         
-        if "Нашёл собеседника!" in text:
+        # Получение паттернов из БД
+        patterns = await self.get_patterns()
+        
+        # Проверка паттернов (в порядке приоритета)
+        if any(p in text for p in patterns['partner_found']):
             await self.on_partner_found()
-        elif "🤚" in text and "завершил диалог" in text:
+        elif any(p in text for p in patterns['partner_skipped']):
             await self.on_partner_skipped()
-        elif "🔴" in text and "недоступна в диалоге" in text:
+        elif any(p in text for p in patterns['already_in_dialog']):
             await log_to_db(self.account_id, "WARNING", "Уже в диалоге")
+        elif any(p in text for p in patterns['system_messages']):
+            # Системное сообщение (подписка на каналы и т.д.) - игнорируем
+            await log_to_db(self.account_id, "INFO", "Системное сообщение, игнорируем")
         elif self.state == WorkerState.WAITING_REPLY:
-            await self.on_partner_replied(event.message)
+            # Это сообщение от собеседника (любое непустое сообщение)
+            if text.strip() or event.message.photo or event.message.sticker or event.message.voice:
+                await self.on_partner_replied(event.message)
+    
+    async def get_patterns(self):
+        """Получить паттерны из БД"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT * FROM bot_patterns WHERE id = 1")
+            result = await cursor.fetchone()
+            
+            if result:
+                return {
+                    'partner_found': result[1].split('|||'),
+                    'partner_skipped': result[2].split('|||'),
+                    'already_in_dialog': result[3].split('|||'),
+                    'system_messages': result[4].split('|||')
+                }
+            else:
+                # Значения по умолчанию
+                return {
+                    'partner_found': ['Нашёл собеседника!'],
+                    'partner_skipped': ['🤚', 'завершил диалог'],
+                    'already_in_dialog': ['🔴', 'недоступна в диалоге'],
+                    'system_messages': ['🛑 Подпишись', 'оставить отзыв']
+                }
     
     async def on_partner_found(self):
         self.state = WorkerState.IN_DIALOG
@@ -1091,6 +1146,99 @@ async def process_cooldown_values(message: Message, state: FSMContext):
         await show_main_menu(message)
     except ValueError:
         await message.answer("❌ Неверный формат")
+
+# ПАТТЕРНЫ
+
+class PatternSettings(StatesGroup):
+    EDIT_FIELD = State()
+
+@router_settings.callback_query(F.data == "set_patterns")
+async def patterns_menu(callback: CallbackQuery):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT partner_found, partner_skipped, already_in_dialog, system_messages FROM bot_patterns WHERE id = 1")
+        result = await cursor.fetchone()
+    
+    if not result:
+        # Создаём запись по умолчанию
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO bot_patterns (id, partner_found, partner_skipped, already_in_dialog, system_messages)
+                VALUES (1, 'Нашёл собеседника!', '🤚|||завершил диалог', '🔴|||недоступна в диалоге', '🛑 Подпишись|||оставить отзыв')
+            """)
+            await db.commit()
+        result = ('Нашёл собеседника!', '🤚|||завершил диалог', '🔴|||недоступна в диалоге', '🛑 Подпишись|||оставить отзыв')
+    
+    partner_found, partner_skipped, already_in_dialog, system_messages = result
+    
+    text = f"""
+🔤 ПАТТЕРНЫ БОТА
+
+Эти фразы бот ищет в сообщениях для определения событий.
+
+📌 Разделяйте фразы через |||
+
+1️⃣ Собеседник найден:
+{partner_found}
+
+2️⃣ Собеседник скипнул:
+{partner_skipped}
+
+3️⃣ Уже в диалоге:
+{already_in_dialog}
+
+4️⃣ Системные сообщения (игнорировать):
+{system_messages}
+"""
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1️⃣ Изменить: Найден", callback_data="pattern_partner_found")],
+        [InlineKeyboardButton(text="2️⃣ Изменить: Скипнул", callback_data="pattern_partner_skipped")],
+        [InlineKeyboardButton(text="3️⃣ Изменить: В диалоге", callback_data="pattern_already_in_dialog")],
+        [InlineKeyboardButton(text="4️⃣ Изменить: Системные", callback_data="pattern_system_messages")],
+        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")]
+    ])
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+@router_settings.callback_query(F.data.startswith("pattern_"))
+async def edit_pattern(callback: CallbackQuery, state: FSMContext):
+    field = callback.data.replace("pattern_", "")
+    
+    field_names = {
+        'partner_found': '1️⃣ Собеседник найден',
+        'partner_skipped': '2️⃣ Собеседник скипнул',
+        'already_in_dialog': '3️⃣ Уже в диалоге',
+        'system_messages': '4️⃣ Системные сообщения'
+    }
+    
+    await callback.message.edit_text(
+        f"✏️ Редактирование: {field_names[field]}\n\n"
+        f"Введите новые фразы через |||\n\n"
+        f"Пример:\n"
+        f"Нашёл собеседника!|||Собеседник найден\n\n"
+        f"Отменить: /cancel"
+    )
+    
+    await state.update_data(pattern_field=field)
+    await state.set_state(PatternSettings.EDIT_FIELD)
+    await callback.answer()
+
+@router_settings.message(PatternSettings.EDIT_FIELD)
+async def process_pattern(message: Message, state: FSMContext):
+    data = await state.get_data()
+    field = data['pattern_field']
+    value = message.text.strip()
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"""
+            UPDATE bot_patterns SET {field} = ? WHERE id = 1
+        """, (value,))
+        await db.commit()
+    
+    await message.answer(f"✅ Паттерн обновлён!")
+    await state.clear()
+    await show_main_menu(message)
 
 # УПРАВЛЕНИЕ
 
