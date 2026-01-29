@@ -504,9 +504,13 @@ class AccountWorker:
             """, (self.account_id, username, user_id, content, content_type))
             await db.commit()
         
-        self.state = WorkerState.PAUSED
-        await update_account_status(self.account_id, WorkerState.PAUSED)
+        # НЕ останавливаем воркер, просто уведомляем
         await self.notify_admin_reply(username, user_id, content, content_type)
+        
+        # Продолжаем ждать (может быть ещё сообщения)
+        # Таймер уже отменён, запускаем новый
+        if self.state == WorkerState.WAITING_REPLY:
+            self.timer_task = asyncio.create_task(self.inactivity_timer())
     
     async def inactivity_timer(self):
         try:
@@ -522,18 +526,20 @@ class AccountWorker:
     
     async def notify_admin_reply(self, username: str, user_id: int, content: str, content_type: str):
         text = f"""
-✅ Аккаунт {self.account_id}: Получен ответ!
+💬 Аккаунт {self.account_id}: Собеседник ответил!
 
 👤 Username: @{username}
 🆔 User ID: {user_id}
 💬 Тип: {content_type}
 📝 Сообщение: {content}
 ⏰ Время: {datetime.now().strftime('%H:%M:%S')}
+
+⚠️ Бот продолжает работать
 """
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⏭ Скип", callback_data=f"worker_skip_{self.account_id}")],
-            [InlineKeyboardButton(text="▶️ Продолжить", callback_data=f"worker_resume_{self.account_id}")],
+            [InlineKeyboardButton(text="⏸ Остановить диалог", callback_data=f"worker_stop_dialog_{self.account_id}")],
+            [InlineKeyboardButton(text="⏭ Скип и продолжить", callback_data=f"worker_skip_{self.account_id}")],
             [InlineKeyboardButton(text="📊 Главное меню", callback_data="main_menu")]
         ])
         
@@ -1269,6 +1275,30 @@ async def stop_all_accounts(callback: CallbackQuery):
 
 # ВОРКЕР КОНТРОЛЬ
 
+# ВОРКЕР КОНТРОЛЬ
+
+@router_control.callback_query(F.data.startswith("worker_stop_dialog_"))
+async def worker_stop_dialog(callback: CallbackQuery):
+    """Остановить текущий диалог и поставить воркер на паузу"""
+    account_id = int(callback.data.split("_")[3])
+    worker = await worker_manager.get_worker(account_id)
+    
+    if worker:
+        # Отправляем /stop в бот
+        try:
+            await worker.client.send_message(TARGET_BOT, '/stop')
+            await log_to_db(account_id, "INFO", "Отправлен /stop")
+        except Exception as e:
+            await log_to_db(account_id, "ERROR", f"Ошибка /stop: {e}")
+        
+        # Ставим на паузу
+        await worker.pause()
+        await callback.answer("✅ Диалог остановлен, воркер на паузе", show_alert=True)
+    else:
+        await callback.answer("❌ Воркер не найден", show_alert=True)
+    
+    await callback.message.delete()
+
 @router_control.callback_query(F.data.startswith("worker_skip_"))
 async def worker_skip(callback: CallbackQuery):
     account_id = int(callback.data.split("_")[2])
@@ -1290,19 +1320,6 @@ async def worker_wait(callback: CallbackQuery):
     if worker:
         await worker.wait_more()
         await callback.answer("✅ Ожидание продолжено", show_alert=True)
-    else:
-        await callback.answer("❌ Воркер не найден", show_alert=True)
-    
-    await callback.message.delete()
-
-@router_control.callback_query(F.data.startswith("worker_resume_"))
-async def worker_resume(callback: CallbackQuery):
-    account_id = int(callback.data.split("_")[2])
-    worker = await worker_manager.get_worker(account_id)
-    
-    if worker:
-        await worker.resume()
-        await callback.answer("✅ Поиск продолжен", show_alert=True)
     else:
         await callback.answer("❌ Воркер не найден", show_alert=True)
     
