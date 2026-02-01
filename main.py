@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Telegram Image to Sticker Pack Bot - ФИНАЛЬНАЯ ВЕРСИЯ
-С поддержкой пользовательских названий стикерпаков
+Telegram Image to Custom Emoji Pack Bot
+Создаёт ЭМОДЗИ паки вместо обычных стикеров
 """
 
 import asyncio
@@ -38,22 +38,18 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 
 if not BOT_TOKEN:
     print("❌ ОШИБКА: BOT_TOKEN не найден в .env файле!")
-    print("📝 Создайте файл .env со строкой:")
-    print("   BOT_TOKEN=ваш_токен_от_BotFather")
     sys.exit(1)
 
-# BOT_USERNAME будет получен автоматически при запуске
 BOT_USERNAME = None
 
-# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Константы
-STICKER_SIZE = 512
+# Константы для ЭМОДЗИ (требования другие!)
+EMOJI_SIZE = 100  # Custom emoji должны быть 100x100
 GRID_SIZES = {
     '3x4': (3, 4),
     '4x6': (4, 6),
@@ -62,17 +58,17 @@ GRID_SIZES = {
     '9x11': (9, 11),
 }
 
-# ==================== FSM СОСТОЯНИЯ ====================
+# ==================== FSM ====================
 
 class ImageProcessing(StatesGroup):
     WAITING_IMAGE = State()
     SELECTING_GRID = State()
     ENTERING_PACK_NAME = State()
 
-# ==================== ПРОЦЕССОР ИЗОБРАЖЕНИЙ ====================
+# ==================== ПРОЦЕССОР ====================
 
 class ImageProcessor:
-    """Обработка изображений"""
+    """Обработка изображений для Custom Emoji"""
     
     @staticmethod
     def resize_and_crop(image: Image.Image, grid_cols: int, grid_rows: int) -> Image.Image:
@@ -93,8 +89,9 @@ class ImageProcessor:
         
         cropped = image.crop((left, top, right, bottom))
         
-        final_width = grid_cols * STICKER_SIZE
-        final_height = grid_rows * STICKER_SIZE
+        # Для Custom Emoji используем 100x100 на каждый элемент
+        final_width = grid_cols * EMOJI_SIZE
+        final_height = grid_rows * EMOJI_SIZE
         
         resized = cropped.resize((final_width, final_height), Image.Resampling.LANCZOS)
         
@@ -120,31 +117,30 @@ class ImageProcessor:
         return slices
     
     @staticmethod
-    def prepare_sticker(image: Image.Image) -> BytesIO:
+    def prepare_emoji(image: Image.Image) -> BytesIO:
+        """
+        ВАЖНО: Custom Emoji требования:
+        - Формат: PNG с прозрачностью
+        - Размер: ТОЧНО 100x100 пикселей
+        - Максимум 50KB
+        """
         if image.mode != 'RGBA':
             image = image.convert('RGBA')
         
-        width, height = image.size
-        if width > height:
-            new_width = STICKER_SIZE
-            new_height = int(height * (STICKER_SIZE / width))
-        else:
-            new_height = STICKER_SIZE
-            new_width = int(width * (STICKER_SIZE / height))
-        
-        image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        # Custom Emoji ДОЛЖНЫ быть ровно 100x100
+        image = image.resize((EMOJI_SIZE, EMOJI_SIZE), Image.Resampling.LANCZOS)
         
         output = BytesIO()
         image.save(output, format='PNG', optimize=True)
         output.seek(0)
-        output.name = 'sticker.png'
+        output.name = 'emoji.png'
         
         return output
 
-# ==================== МЕНЕДЖЕР СТИКЕРПАКОВ ====================
+# ==================== МЕНЕДЖЕР ПАКОВ ====================
 
-class StickerPackManager:
-    """Управление стикерпаками"""
+class EmojiPackManager:
+    """Управление Custom Emoji паками"""
     
     @staticmethod
     def generate_pack_name(user_id: int, bot_username: str) -> str:
@@ -155,47 +151,59 @@ class StickerPackManager:
             timestamp_short = datetime.now().strftime('%y%m%d%H%M')
             pack_name = f"u{user_id}_{timestamp_short}_by_{bot_username}"
         
-        logger.info(f"Имя пака: {pack_name}")
+        logger.info(f"📝 Имя пака: {pack_name}")
         return pack_name
     
     @staticmethod
-    async def create_sticker_pack(
+    async def create_emoji_pack(
         bot: Bot,
         user_id: int,
         pack_name: str,
         pack_title: str,
-        stickers: list[BytesIO],
+        emojis: list[BytesIO],
     ) -> tuple[bool, Optional[str]]:
+        """
+        ВАЖНО: Создание Custom Emoji пака
+        
+        API: createNewStickerSet с sticker_type="custom_emoji"
+        Требование: У пользователя ДОЛЖЕН быть Telegram Premium!
+        """
         try:
-            first_sticker_data = stickers[0]
-            first_sticker_data.seek(0)
+            logger.info(f"🎨 Создаю Custom Emoji пак для user {user_id}")
             
+            first_emoji_data = emojis[0]
+            first_emoji_data.seek(0)
+            
+            # КЛЮЧЕВОЕ ОТЛИЧИЕ: sticker_type="custom_emoji"
             first_input_sticker = InputSticker(
                 sticker=BufferedInputFile(
-                    first_sticker_data.read(),
-                    filename="sticker.png"
+                    first_emoji_data.read(),
+                    filename="emoji.png"
                 ),
                 emoji_list=["🖼️"],
                 format="static"
             )
             
+            # Создаём Custom Emoji набор
             await bot.create_new_sticker_set(
                 user_id=user_id,
                 name=pack_name,
                 title=pack_title,
-                stickers=[first_input_sticker]
+                stickers=[first_input_sticker],
+                sticker_type="custom_emoji"  # ← ЭТО ГЛАВНОЕ!
             )
             
-            logger.info(f"✅ Создан: {pack_name}")
+            logger.info(f"✅ Custom Emoji пак создан: {pack_name}")
             
-            for idx, sticker_data in enumerate(stickers[1:], start=2):
+            # Добавляем остальные эмодзи
+            for idx, emoji_data in enumerate(emojis[1:], start=2):
                 try:
-                    sticker_data.seek(0)
+                    emoji_data.seek(0)
                     
                     input_sticker = InputSticker(
                         sticker=BufferedInputFile(
-                            sticker_data.read(),
-                            filename=f"sticker_{idx}.png"
+                            emoji_data.read(),
+                            filename=f"emoji_{idx}.png"
                         ),
                         emoji_list=["🖼️"],
                         format="static"
@@ -208,17 +216,23 @@ class StickerPackManager:
                     )
                     
                     await asyncio.sleep(0.05)
-                    logger.info(f"✅ Стикер {idx}/{len(stickers)}")
+                    logger.info(f"✅ Эмодзи {idx}/{len(emojis)}")
                     
                 except Exception as e:
-                    logger.error(f"⚠️  Ошибка стикера {idx}: {e}")
+                    logger.error(f"⚠️  Ошибка эмодзи {idx}: {e}")
                     continue
             
+            logger.info(f"🎉 Пак завершён: {len(emojis)} эмодзи")
             return True, None
             
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"❌ Ошибка пака: {error_msg}")
+            logger.error(f"❌ Ошибка создания: {error_msg}")
+            
+            # Проверка на отсутствие Premium
+            if "PREMIUM_ACCOUNT_REQUIRED" in error_msg or "premium" in error_msg.lower():
+                return False, "Для Custom Emoji нужен Telegram Premium"
+            
             return False, error_msg
 
 # ==================== КЛАВИАТУРЫ ====================
@@ -234,9 +248,9 @@ def get_grid_size_keyboard() -> InlineKeyboardMarkup:
     row = []
     
     for size_label, (cols, rows) in GRID_SIZES.items():
-        total_stickers = cols * rows
+        total = cols * rows
         button = InlineKeyboardButton(
-            text=f"{size_label} ({total_stickers} стикеров)",
+            text=f"{size_label} ({total} эмодзи)",
             callback_data=f"grid_{size_label}"
         )
         row.append(button)
@@ -261,7 +275,7 @@ def get_cancel_keyboard() -> InlineKeyboardMarkup:
 
 router = Router()
 
-# ==================== ОБРАБОТЧИКИ ====================
+# ==================== КОМАНДЫ ====================
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -270,13 +284,15 @@ async def cmd_start(message: Message, state: FSMContext):
     welcome_text = """
 👋 Добро пожаловать!
 
-📸 Я конвертирую изображения в стикерпаки для мозаичных эффектов!
+🎨 Я конвертирую изображения в **Custom Emoji** паки!
+
+⚠️ **ВАЖНО**: Нужен Telegram Premium для создания Custom Emoji!
 
 💡 Как использовать:
 1️⃣ Загрузите изображение
 2️⃣ Выберите размер сетки
-3️⃣ Задайте название пака
-4️⃣ Получите готовый стикерпак!
+3️⃣ Задайте название
+4️⃣ Получите эмодзи-пак!
 
 🚀 Готовы?
 """
@@ -289,16 +305,18 @@ async def cmd_help(message: Message):
 ℹ️ ПОМОЩЬ
 
 📋 Размеры сетки:
-• 3x4 = 12 стикеров
-• 4x6 = 24 стикера
-• 5x8 = 40 стикеров
-• 7x9 = 63 стикера
-• 9x11 = 99 стикеров
+• 3x4 = 12 эмодзи
+• 4x6 = 24 эмодзи
+• 5x8 = 40 эмодзи
+• 7x9 = 63 эмодзи
+• 9x11 = 99 эмодзи
 
-💡 Советы:
-• Отправляйте как файл
-• Минимум 512px
-• Добавьте размер в название пака
+⚠️ Требования:
+• Telegram Premium (обязательно!)
+• Изображение минимум 300x300px
+
+💡 Что такое Custom Emoji?
+Это НЕ стикеры! Это специальные эмодзи которые можно использовать в тексте сообщений.
 
 ❓ Команды:
 /start /cancel /help
@@ -309,20 +327,20 @@ async def cmd_help(message: Message):
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     current_state = await state.get_state()
-    
     if current_state is None:
         await message.answer("❌ Нечего отменять", reply_markup=get_main_menu_keyboard())
         return
-    
     await state.clear()
     await message.answer("✅ Отменено", reply_markup=get_main_menu_keyboard())
+
+# ==================== CALLBACKS ====================
 
 @router.callback_query(F.data == "upload_image")
 async def callback_upload_image(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "📸 Отправьте изображение\n\n"
         "💡 Для лучшего качества — как файл\n"
-        "📏 Минимум: 512px",
+        "📏 Минимум: 300x300px",
         reply_markup=get_cancel_keyboard()
     )
     await state.set_state(ImageProcessing.WAITING_IMAGE)
@@ -330,42 +348,23 @@ async def callback_upload_image(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "show_help")
 async def callback_show_help(callback: CallbackQuery):
-    help_text = """
-ℹ️ КАК ИСПОЛЬЗОВАТЬ
-
-1️⃣ Отправьте изображение
-2️⃣ Выберите сетку
-3️⃣ Задайте название
-4️⃣ Откройте стикерпак
-
-🎨 Отправляйте стикеры по порядку:
-слева-направо, сверху-вниз
-"""
-    
-    await callback.message.edit_text(help_text, reply_markup=get_main_menu_keyboard())
+    await cmd_help(callback.message)
     await callback.answer()
 
 @router.callback_query(F.data == "back_to_menu")
 async def callback_back_to_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text(
-        "📊 Главное меню",
-        reply_markup=get_main_menu_keyboard()
-    )
+    await callback.message.edit_text("📊 Главное меню", reply_markup=get_main_menu_keyboard())
     await callback.answer()
 
 @router.callback_query(F.data == "cancel")
 async def callback_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text(
-        "✅ Отменено",
-        reply_markup=get_main_menu_keyboard()
-    )
+    await callback.message.edit_text("✅ Отменено", reply_markup=get_main_menu_keyboard())
     await callback.answer()
 
 @router.callback_query(F.data.startswith("grid_"))
 async def callback_grid_selection(callback: CallbackQuery, state: FSMContext):
-    """Выбор сетки → запрос названия"""
     grid_size = callback.data.replace('grid_', '')
     
     if grid_size not in GRID_SIZES:
@@ -384,10 +383,8 @@ async def callback_grid_selection(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
     
-    # Сохраняем параметры сетки
     await state.update_data(grid_size=grid_size, grid_cols=cols, grid_rows=rows)
     
-    # Запрашиваем название
     text = f"""
 ✅ Выбрана сетка: {grid_size}
 
@@ -408,18 +405,13 @@ async def callback_grid_selection(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("default_name_"))
 async def callback_default_name(callback: CallbackQuery, state: FSMContext):
-    """Использовать стандартное название"""
     grid_size = callback.data.replace('default_name_', '')
-    
     await state.update_data(pack_title=grid_size)
     await callback.answer("✅ Стандартное название")
-    
-    # Запускаем обработку
     await process_image_and_create_pack(callback, state)
 
 @router.callback_query(F.data == "back_to_grid")
 async def callback_back_to_grid(callback: CallbackQuery, state: FSMContext):
-    """Вернуться к выбору сетки"""
     await callback.message.edit_text(
         "🎯 Выберите размер сетки:",
         reply_markup=get_grid_size_keyboard()
@@ -429,22 +421,16 @@ async def callback_back_to_grid(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ImageProcessing.ENTERING_PACK_NAME, F.text)
 async def handle_pack_name_input(message: Message, state: FSMContext):
-    """Обработка введённого названия"""
     pack_title = message.text.strip()
     
-    # Проверка длины
     if len(pack_title) > 15:
-        await message.answer(
-            f"❌ Слишком длинное ({len(pack_title)} символов)\n"
-            "Максимум 15. Попробуйте ещё:"
-        )
+        await message.answer(f"❌ Слишком длинное ({len(pack_title)} символов)\nМаксимум 15:")
         return
     
     if len(pack_title) < 1:
         await message.answer("❌ Не может быть пустым:")
         return
     
-    # Сохраняем
     await state.update_data(pack_title=pack_title)
     
     processing_msg = await message.answer(
@@ -453,7 +439,6 @@ async def handle_pack_name_input(message: Message, state: FSMContext):
         "⏳ Подождите 1-2 минуты..."
     )
     
-    # Создаём обёртку для переиспользования функции
     class CallbackWrapper:
         def __init__(self, msg, bot, user):
             self.message = msg
@@ -466,7 +451,7 @@ async def handle_pack_name_input(message: Message, state: FSMContext):
     await process_image_and_create_pack(wrapper, state)
 
 async def process_image_and_create_pack(callback, state: FSMContext):
-    """Основная обработка и создание пака"""
+    """Обработка и создание Custom Emoji пака"""
     data = await state.get_data()
     
     file_id = data.get('image_file_id')
@@ -486,21 +471,21 @@ async def process_image_and_create_pack(callback, state: FSMContext):
     temp_dir = tempfile.mkdtemp()
     
     try:
-        # Скачиваем
+        logger.info(f"📥 Скачиваю изображение...")
         file = await callback.bot.get_file(file_id)
         image_path = os.path.join(temp_dir, 'original.jpg')
         await callback.bot.download_file(file.file_path, image_path)
         
-        # Обрабатываем
+        logger.info(f"🖼️  Обрабатываю изображение...")
         with Image.open(image_path) as img:
             if img.mode not in ('RGB', 'RGBA'):
                 img = img.convert('RGB')
             
             min_dimension = min(img.width, img.height)
-            if min_dimension < 512:
+            if min_dimension < 300:
                 await callback.message.edit_text(
                     f"❌ Слишком маленькое ({img.width}x{img.height})\n"
-                    f"Минимум: 512px",
+                    f"Минимум: 300x300px",
                     reply_markup=get_main_menu_keyboard()
                 )
                 await state.clear()
@@ -510,66 +495,73 @@ async def process_image_and_create_pack(callback, state: FSMContext):
             processed_img = processor.resize_and_crop(img, cols, rows)
             slices = processor.slice_image(processed_img, cols, rows)
             
-            sticker_files = []
+            emoji_files = []
             for slice_img in slices:
-                sticker_data = processor.prepare_sticker(slice_img)
-                sticker_files.append(sticker_data)
+                emoji_data = processor.prepare_emoji(slice_img)
+                emoji_files.append(emoji_data)
             
-            logger.info(f"Создано {len(sticker_files)} стикеров")
+            logger.info(f"✅ Создано {len(emoji_files)} эмодзи")
         
-        # Создаём пак
-        pack_manager = StickerPackManager()
+        logger.info(f"📦 Создаю Custom Emoji пак...")
+        pack_manager = EmojiPackManager()
         pack_name = pack_manager.generate_pack_name(callback.from_user.id, BOT_USERNAME)
         
         await callback.message.edit_text(
-            f"📦 Создание с {len(sticker_files)} стикерами...\n"
-            f"📝 {pack_title}\n\n"
+            f"📦 Создание Custom Emoji пака...\n"
+            f"📝 {pack_title}\n"
+            f"🎨 {len(emoji_files)} эмодзи\n\n"
             "⏳ Ещё минуту..."
         )
         
-        success, error_msg = await pack_manager.create_sticker_pack(
+        success, error_msg = await pack_manager.create_emoji_pack(
             bot=callback.bot,
             user_id=callback.from_user.id,
             pack_name=pack_name,
             pack_title=pack_title,
-            stickers=sticker_files,
+            emojis=emoji_files,
         )
         
         if success:
-            pack_url = f"https://t.me/addstickers/{pack_name}"
+            pack_url = f"https://t.me/addemoji/{pack_name}"
             
             result_text = f"""
-✅ Готово!
+✅ Готово! Эмодзи-пак создан!
 
 🎨 {pack_title}
-📊 {grid_size} ({cols*rows} стикеров)
+📊 {grid_size} ({cols*rows} эмодзи)
 
 🔗 {pack_url}
 
-💡 Отправляйте стикеры по порядку (слева-направо, сверху-вниз)!
+💡 Нажмите на ссылку чтобы добавить эмодзи!
+Используйте их в любом чате как обычные эмодзи.
+
+📝 Отправляйте по порядку (слева-направо, сверху-вниз) для создания мозаики!
 """
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔗 Открыть", url=pack_url)],
-                [InlineKeyboardButton(text="📸 Ещё", callback_data="upload_image")],
+                [InlineKeyboardButton(text="🔗 Открыть эмодзи-пак", url=pack_url)],
+                [InlineKeyboardButton(text="📸 Создать ещё", callback_data="upload_image")],
                 [InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")]
             ])
             
             await callback.message.edit_text(result_text, reply_markup=keyboard)
+            logger.info(f"🎉 Пак успешно создан и отправлен!")
         else:
             error_details = f"\n\n🔍 {error_msg}" if error_msg else ""
             await callback.message.edit_text(
                 f"❌ Не удалось создать{error_details}\n\n"
-                "💡 Попробуйте:\n"
-                "• Другое изображение\n"
-                "• Меньшую сетку",
+                "💡 Возможные причины:\n"
+                "• Нет Telegram Premium\n"
+                "• Слишком большое изображение\n"
+                "• Попробуйте меньшую сетку",
                 reply_markup=get_main_menu_keyboard()
             )
+            logger.error(f"❌ Создание не удалось: {error_msg}")
         
         await state.clear()
     
     except Exception as e:
-        logger.error(f"Ошибка: {e}", exc_info=True)
+        logger.error(f"💥 Критическая ошибка: {e}", exc_info=True)
         await callback.message.edit_text(
             f"❌ Ошибка:\n{str(e)[:200]}",
             reply_markup=get_main_menu_keyboard()
@@ -579,67 +571,45 @@ async def process_image_and_create_pack(callback, state: FSMContext):
     finally:
         try:
             shutil.rmtree(temp_dir)
+            logger.info(f"🧹 Очищено: {temp_dir}")
         except Exception as e:
-            logger.error(f"Очистка: {e}")
+            logger.error(f"⚠️  Очистка: {e}")
 
 @router.message(ImageProcessing.WAITING_IMAGE, F.photo | F.document)
 async def handle_image(message: Message, state: FSMContext):
-    """Обработка изображения"""
     if message.photo:
         file_id = message.photo[-1].file_id
-        await message.answer(
-            "📸 Получено!\n"
-            "💡 В следующий раз — как файл\n"
-            "⏳ Готовлю опции..."
-        )
+        await message.answer("📸 Получено!\n💡 В следующий раз — как файл\n⏳ Готовлю...")
     elif message.document:
         document = message.document
         if not document.mime_type or not document.mime_type.startswith('image/'):
-            await message.answer(
-                "❌ Отправьте изображение",
-                reply_markup=get_cancel_keyboard()
-            )
+            await message.answer("❌ Отправьте изображение", reply_markup=get_cancel_keyboard())
             return
         file_id = document.file_id
         await message.answer("📁 Файл получен!\n⏳ Готовлю...")
     else:
-        await message.answer(
-            "❌ Отправьте изображение",
-            reply_markup=get_cancel_keyboard()
-        )
+        await message.answer("❌ Отправьте изображение", reply_markup=get_cancel_keyboard())
         return
     
     await state.update_data(image_file_id=file_id)
-    
-    await message.answer(
-        "🎯 Выберите размер сетки:",
-        reply_markup=get_grid_size_keyboard()
-    )
-    
+    await message.answer("🎯 Выберите размер сетки:", reply_markup=get_grid_size_keyboard())
     await state.set_state(ImageProcessing.SELECTING_GRID)
 
 @router.message(ImageProcessing.WAITING_IMAGE)
 async def handle_wrong_content(message: Message):
-    await message.answer(
-        "❌ Отправьте изображение",
-        reply_markup=get_cancel_keyboard()
-    )
+    await message.answer("❌ Отправьте изображение", reply_markup=get_cancel_keyboard())
 
 @router.message()
 async def handle_any_message(message: Message):
-    await message.answer(
-        "👋 Используйте /start",
-        reply_markup=get_main_menu_keyboard()
-    )
+    await message.answer("👋 Используйте /start", reply_markup=get_main_menu_keyboard())
 
-# ==================== ГЛАВНАЯ ФУНКЦИЯ ====================
+# ==================== MAIN ====================
 
 async def main():
-    """Запуск бота"""
     global BOT_USERNAME
     
     print("=" * 60)
-    print("🚀 Image to Sticker Pack Bot")
+    print("🎨 Custom Emoji Pack Bot")
     print("=" * 60)
     
     os.makedirs('logs', exist_ok=True)
@@ -650,15 +620,16 @@ async def main():
     
     dp.include_router(router)
     
-    # Получаем username автоматически
     bot_info = await bot.get_me()
     BOT_USERNAME = bot_info.username
     
     print(f"🤖 Бот: @{bot_info.username}")
     print(f"🆔 ID: {bot_info.id}")
     print(f"📝 Username: {BOT_USERNAME}")
+    print(f"🎨 Тип: Custom Emoji (НЕ стикеры!)")
     print("=" * 60)
     print("✅ Запущен!")
+    print("⚠️  Требуется Telegram Premium у пользователей!")
     print("💡 Ctrl+C для остановки")
     print("=" * 60)
     
@@ -676,5 +647,5 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\n👋 До свидания!")
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+        logger.error(f"💥 Критическая ошибка: {e}", exc_info=True)
         sys.exit(1)
