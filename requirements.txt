@@ -7,6 +7,9 @@ telethon==1.37.0
 # Async SQLite
 aiosqlite==0.20.0
 
+# Image processing
+Pillow==10.4.0
+
 # Environment Variables
 python-dotenv==1.0.1
 
