@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Telegram Image to Sticker Pack Bot - ИСПРАВЛЕННАЯ ВЕРСИЯ
-Полностью рабочий код с правильным API для aiogram 3.x
+Telegram Image to Sticker Pack Bot - ФИНАЛЬНАЯ ВЕРСИЯ
+С поддержкой пользовательских названий стикерпаков
 """
 
 import asyncio
@@ -67,15 +67,15 @@ GRID_SIZES = {
 class ImageProcessing(StatesGroup):
     WAITING_IMAGE = State()
     SELECTING_GRID = State()
+    ENTERING_PACK_NAME = State()
 
 # ==================== ПРОЦЕССОР ИЗОБРАЖЕНИЙ ====================
 
 class ImageProcessor:
-    """Обработка изображений для создания стикеров"""
+    """Обработка изображений"""
     
     @staticmethod
     def resize_and_crop(image: Image.Image, grid_cols: int, grid_rows: int) -> Image.Image:
-        """Изменить размер и обрезать изображение под сетку"""
         target_ratio = grid_cols / grid_rows
         current_ratio = image.width / image.height
         
@@ -102,7 +102,6 @@ class ImageProcessor:
     
     @staticmethod
     def slice_image(image: Image.Image, grid_cols: int, grid_rows: int) -> list[Image.Image]:
-        """Разрезать изображение на сетку"""
         slice_width = image.width // grid_cols
         slice_height = image.height // grid_rows
         
@@ -122,7 +121,6 @@ class ImageProcessor:
     
     @staticmethod
     def prepare_sticker(image: Image.Image) -> BytesIO:
-        """Конвертировать кусок изображения в формат стикера"""
         if image.mode != 'RGBA':
             image = image.convert('RGBA')
         
@@ -139,34 +137,25 @@ class ImageProcessor:
         output = BytesIO()
         image.save(output, format='PNG', optimize=True)
         output.seek(0)
-        output.name = 'sticker.png'  # ВАЖНО: добавляем имя файла
+        output.name = 'sticker.png'
         
         return output
 
 # ==================== МЕНЕДЖЕР СТИКЕРПАКОВ ====================
 
 class StickerPackManager:
-    """Управление созданием стикерпаков"""
+    """Управление стикерпаками"""
     
     @staticmethod
     def generate_pack_name(user_id: int, bot_username: str) -> str:
-        """
-        Генерация имени стикерпака по правилам Telegram:
-        - Только буквы, цифры и подчёркивания
-        - Должно заканчиваться на _by_{bot_username}
-        - Длина до 64 символов
-        """
         timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-        # Формат: u{user_id}_{timestamp}_by_{bot_username}
         pack_name = f"u{user_id}_{timestamp}_by_{bot_username}"
         
-        # Проверка длины (максимум 64 символа)
         if len(pack_name) > 64:
-            # Укорачиваем timestamp если имя слишком длинное
             timestamp_short = datetime.now().strftime('%y%m%d%H%M')
             pack_name = f"u{user_id}_{timestamp_short}_by_{bot_username}"
         
-        logger.info(f"Сгенерировано имя пака: {pack_name}")
+        logger.info(f"Имя пака: {pack_name}")
         return pack_name
     
     @staticmethod
@@ -177,18 +166,10 @@ class StickerPackManager:
         pack_title: str,
         stickers: list[BytesIO],
     ) -> tuple[bool, Optional[str]]:
-        """
-        Создать стикерпак используя правильный API aiogram 3.x
-        
-        Returns:
-            (success: bool, error_message: Optional[str])
-        """
         try:
-            # Подготовка первого стикера
             first_sticker_data = stickers[0]
             first_sticker_data.seek(0)
             
-            # ИСПРАВЛЕНО: Правильный формат InputSticker для aiogram 3.x
             first_input_sticker = InputSticker(
                 sticker=BufferedInputFile(
                     first_sticker_data.read(),
@@ -198,7 +179,6 @@ class StickerPackManager:
                 format="static"
             )
             
-            # Создаём стикерсет
             await bot.create_new_sticker_set(
                 user_id=user_id,
                 name=pack_name,
@@ -206,9 +186,8 @@ class StickerPackManager:
                 stickers=[first_input_sticker]
             )
             
-            logger.info(f"✅ Создан стикерпак: {pack_name}")
+            logger.info(f"✅ Создан: {pack_name}")
             
-            # Добавляем остальные стикеры
             for idx, sticker_data in enumerate(stickers[1:], start=2):
                 try:
                     sticker_data.seek(0)
@@ -228,33 +207,29 @@ class StickerPackManager:
                         sticker=input_sticker
                     )
                     
-                    # Задержка против rate limits
                     await asyncio.sleep(0.05)
-                    
-                    logger.info(f"✅ Добавлен стикер {idx}/{len(stickers)}")
+                    logger.info(f"✅ Стикер {idx}/{len(stickers)}")
                     
                 except Exception as e:
-                    logger.error(f"⚠️  Ошибка добавления стикера {idx}: {e}")
+                    logger.error(f"⚠️  Ошибка стикера {idx}: {e}")
                     continue
             
             return True, None
             
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"❌ Ошибка создания стикерпака: {error_msg}")
+            logger.error(f"❌ Ошибка пака: {error_msg}")
             return False, error_msg
 
 # ==================== КЛАВИАТУРЫ ====================
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Главное меню"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📸 Загрузить изображение", callback_data="upload_image")],
         [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="show_help")]
     ])
 
 def get_grid_size_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура выбора сетки"""
     keyboard = []
     row = []
     
@@ -278,7 +253,6 @@ def get_grid_size_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_cancel_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура отмены"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
     ])
@@ -291,34 +265,26 @@ router = Router()
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    """Команда /start"""
     await state.clear()
     
     welcome_text = """
-👋 Добро пожаловать в Image to Sticker Pack Bot!
+👋 Добро пожаловать!
 
-📸 Я конвертирую ваши изображения в стикерпаки для создания мозаичных эффектов!
+📸 Я конвертирую изображения в стикерпаки для мозаичных эффектов!
 
 💡 Как использовать:
-1️⃣ Нажмите "📸 Загрузить изображение"
-2️⃣ Отправьте фото или файл
-3️⃣ Выберите размер сетки
+1️⃣ Загрузите изображение
+2️⃣ Выберите размер сетки
+3️⃣ Задайте название пака
 4️⃣ Получите готовый стикерпак!
 
-✨ Особенности:
-• Бесплатно и без ограничений
-• 5 размеров сетки (3x4 до 9x11)
-• Высокое качество
-• Быстрая обработка
-
-🚀 Готовы начать?
+🚀 Готовы?
 """
     
     await message.answer(welcome_text, reply_markup=get_main_menu_keyboard())
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    """Команда /help"""
     help_text = """
 ℹ️ ПОМОЩЬ
 
@@ -330,21 +296,18 @@ async def cmd_help(message: Message):
 • 9x11 = 99 стикеров
 
 💡 Советы:
-• Отправляйте как файл для лучшего качества
-• Минимум 512px на меньшей стороне
-• Большие изображения дают лучший результат
+• Отправляйте как файл
+• Минимум 512px
+• Добавьте размер в название пака
 
 ❓ Команды:
-• /start - начать заново
-• /cancel - отменить операцию
-• /help - эта справка
+/start /cancel /help
 """
     
     await message.answer(help_text, reply_markup=get_main_menu_keyboard())
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
-    """Команда /cancel"""
     current_state = await state.get_state()
     
     if current_state is None:
@@ -352,15 +315,14 @@ async def cmd_cancel(message: Message, state: FSMContext):
         return
     
     await state.clear()
-    await message.answer("✅ Операция отменена", reply_markup=get_main_menu_keyboard())
+    await message.answer("✅ Отменено", reply_markup=get_main_menu_keyboard())
 
 @router.callback_query(F.data == "upload_image")
 async def callback_upload_image(callback: CallbackQuery, state: FSMContext):
-    """Начало загрузки"""
     await callback.message.edit_text(
         "📸 Отправьте изображение\n\n"
-        "💡 Для лучшего качества отправляйте как файл\n"
-        "📏 Минимум: 512px на меньшей стороне",
+        "💡 Для лучшего качества — как файл\n"
+        "📏 Минимум: 512px",
         reply_markup=get_cancel_keyboard()
     )
     await state.set_state(ImageProcessing.WAITING_IMAGE)
@@ -368,19 +330,16 @@ async def callback_upload_image(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "show_help")
 async def callback_show_help(callback: CallbackQuery):
-    """Показать помощь"""
     help_text = """
 ℹ️ КАК ИСПОЛЬЗОВАТЬ
 
 1️⃣ Отправьте изображение
-2️⃣ Выберите размер сетки
-3️⃣ Дождитесь создания пака
+2️⃣ Выберите сетку
+3️⃣ Задайте название
 4️⃣ Откройте стикерпак
 
-🎨 В чате отправляйте стикеры по порядку:
+🎨 Отправляйте стикеры по порядку:
 слева-направо, сверху-вниз
-
-💡 Чем больше сетка = детальнее мозаика!
 """
     
     await callback.message.edit_text(help_text, reply_markup=get_main_menu_keyboard())
@@ -388,7 +347,6 @@ async def callback_show_help(callback: CallbackQuery):
 
 @router.callback_query(F.data == "back_to_menu")
 async def callback_back_to_menu(callback: CallbackQuery, state: FSMContext):
-    """Назад в меню"""
     await state.clear()
     await callback.message.edit_text(
         "📊 Главное меню",
@@ -398,17 +356,16 @@ async def callback_back_to_menu(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "cancel")
 async def callback_cancel(callback: CallbackQuery, state: FSMContext):
-    """Отмена"""
     await state.clear()
     await callback.message.edit_text(
-        "✅ Операция отменена",
+        "✅ Отменено",
         reply_markup=get_main_menu_keyboard()
     )
     await callback.answer()
 
 @router.callback_query(F.data.startswith("grid_"))
 async def callback_grid_selection(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора сетки"""
+    """Выбор сетки → запрос названия"""
     grid_size = callback.data.replace('grid_', '')
     
     if grid_size not in GRID_SIZES:
@@ -427,11 +384,104 @@ async def callback_grid_selection(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
     
+    # Сохраняем параметры сетки
+    await state.update_data(grid_size=grid_size, grid_cols=cols, grid_rows=rows)
+    
+    # Запрашиваем название
+    text = f"""
+✅ Выбрана сетка: {grid_size}
+
+📝 Введите название пака (до 15 символов):
+Или нажмите кнопку для стандартного названия с размером сетки — {grid_size}
+
+💡 Совет — если вы хотите, чтобы паком пользовались другие люди, добавьте в название размер сетки, например 3x5. Так люди смогут понять, как именно надо собирать картинку, сколько эмодзи должно быть в ряду.
+"""
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Стандартное название", callback_data=f"default_name_{grid_size}")],
+        [InlineKeyboardButton(text="🔙 Изменить сетку", callback_data="back_to_grid")]
+    ])
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await state.set_state(ImageProcessing.ENTERING_PACK_NAME)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("default_name_"))
+async def callback_default_name(callback: CallbackQuery, state: FSMContext):
+    """Использовать стандартное название"""
+    grid_size = callback.data.replace('default_name_', '')
+    
+    await state.update_data(pack_title=grid_size)
+    await callback.answer("✅ Стандартное название")
+    
+    # Запускаем обработку
+    await process_image_and_create_pack(callback, state)
+
+@router.callback_query(F.data == "back_to_grid")
+async def callback_back_to_grid(callback: CallbackQuery, state: FSMContext):
+    """Вернуться к выбору сетки"""
     await callback.message.edit_text(
-        f"⚙️ Обработка {grid_size} ({cols}x{rows} = {cols*rows} стикеров)...\n\n"
+        "🎯 Выберите размер сетки:",
+        reply_markup=get_grid_size_keyboard()
+    )
+    await state.set_state(ImageProcessing.SELECTING_GRID)
+    await callback.answer()
+
+@router.message(ImageProcessing.ENTERING_PACK_NAME, F.text)
+async def handle_pack_name_input(message: Message, state: FSMContext):
+    """Обработка введённого названия"""
+    pack_title = message.text.strip()
+    
+    # Проверка длины
+    if len(pack_title) > 15:
+        await message.answer(
+            f"❌ Слишком длинное ({len(pack_title)} символов)\n"
+            "Максимум 15. Попробуйте ещё:"
+        )
+        return
+    
+    if len(pack_title) < 1:
+        await message.answer("❌ Не может быть пустым:")
+        return
+    
+    # Сохраняем
+    await state.update_data(pack_title=pack_title)
+    
+    processing_msg = await message.answer(
+        f"⚙️ Обработка...\n"
+        f"📝 {pack_title}\n\n"
         "⏳ Подождите 1-2 минуты..."
     )
-    await callback.answer()
+    
+    # Создаём обёртку для переиспользования функции
+    class CallbackWrapper:
+        def __init__(self, msg, bot, user):
+            self.message = msg
+            self.bot = bot
+            self.from_user = user
+        async def answer(self, text="", show_alert=False):
+            pass
+    
+    wrapper = CallbackWrapper(processing_msg, message.bot, message.from_user)
+    await process_image_and_create_pack(wrapper, state)
+
+async def process_image_and_create_pack(callback, state: FSMContext):
+    """Основная обработка и создание пака"""
+    data = await state.get_data()
+    
+    file_id = data.get('image_file_id')
+    grid_size = data.get('grid_size')
+    cols = data.get('grid_cols')
+    rows = data.get('grid_rows')
+    pack_title = data.get('pack_title', grid_size)
+    
+    if not all([file_id, grid_size, cols, rows]):
+        await callback.message.edit_text(
+            "❌ Данные потеряны. Начните заново.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        await state.clear()
+        return
     
     temp_dir = tempfile.mkdtemp()
     
@@ -449,8 +499,8 @@ async def callback_grid_selection(callback: CallbackQuery, state: FSMContext):
             min_dimension = min(img.width, img.height)
             if min_dimension < 512:
                 await callback.message.edit_text(
-                    f"❌ Изображение слишком маленькое ({img.width}x{img.height})\n"
-                    f"Минимум: 512px на меньшей стороне",
+                    f"❌ Слишком маленькое ({img.width}x{img.height})\n"
+                    f"Минимум: 512px",
                     reply_markup=get_main_menu_keyboard()
                 )
                 await state.clear()
@@ -470,10 +520,10 @@ async def callback_grid_selection(callback: CallbackQuery, state: FSMContext):
         # Создаём пак
         pack_manager = StickerPackManager()
         pack_name = pack_manager.generate_pack_name(callback.from_user.id, BOT_USERNAME)
-        pack_title = f"My {grid_size} Image"
         
         await callback.message.edit_text(
-            f"📦 Создание пака с {len(sticker_files)} стикерами...\n"
+            f"📦 Создание с {len(sticker_files)} стикерами...\n"
+            f"📝 {pack_title}\n\n"
             "⏳ Ещё минуту..."
         )
         
@@ -489,31 +539,30 @@ async def callback_grid_selection(callback: CallbackQuery, state: FSMContext):
             pack_url = f"https://t.me/addstickers/{pack_name}"
             
             result_text = f"""
-✅ Готово! Стикерпак создан!
+✅ Готово!
 
 🎨 {pack_title}
 📊 {grid_size} ({cols*rows} стикеров)
 
 🔗 {pack_url}
 
-💡 Отправляйте стикеры по порядку для создания мозаики!
+💡 Отправляйте стикеры по порядку (слева-направо, сверху-вниз)!
 """
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔗 Открыть стикерпак", url=pack_url)],
-                [InlineKeyboardButton(text="📸 Создать ещё", callback_data="upload_image")],
+                [InlineKeyboardButton(text="🔗 Открыть", url=pack_url)],
+                [InlineKeyboardButton(text="📸 Ещё", callback_data="upload_image")],
                 [InlineKeyboardButton(text="🔙 Меню", callback_data="back_to_menu")]
             ])
             
             await callback.message.edit_text(result_text, reply_markup=keyboard)
         else:
-            error_details = f"\n\n🔍 Детали: {error_msg}" if error_msg else ""
+            error_details = f"\n\n🔍 {error_msg}" if error_msg else ""
             await callback.message.edit_text(
-                f"❌ Не удалось создать стикерпак{error_details}\n\n"
+                f"❌ Не удалось создать{error_details}\n\n"
                 "💡 Попробуйте:\n"
-                "• Проверить BOT_USERNAME в .env\n"
-                "• Использовать другое изображение\n"
-                "• Попробовать меньшую сетку",
+                "• Другое изображение\n"
+                "• Меньшую сетку",
                 reply_markup=get_main_menu_keyboard()
             )
         
@@ -522,7 +571,7 @@ async def callback_grid_selection(callback: CallbackQuery, state: FSMContext):
     except Exception as e:
         logger.error(f"Ошибка: {e}", exc_info=True)
         await callback.message.edit_text(
-            f"❌ Ошибка обработки:\n{str(e)[:200]}",
+            f"❌ Ошибка:\n{str(e)[:200]}",
             reply_markup=get_main_menu_keyboard()
         )
         await state.clear()
@@ -531,7 +580,7 @@ async def callback_grid_selection(callback: CallbackQuery, state: FSMContext):
         try:
             shutil.rmtree(temp_dir)
         except Exception as e:
-            logger.error(f"Ошибка очистки: {e}")
+            logger.error(f"Очистка: {e}")
 
 @router.message(ImageProcessing.WAITING_IMAGE, F.photo | F.document)
 async def handle_image(message: Message, state: FSMContext):
@@ -539,20 +588,20 @@ async def handle_image(message: Message, state: FSMContext):
     if message.photo:
         file_id = message.photo[-1].file_id
         await message.answer(
-            "📸 Фото получено!\n\n"
-            "💡 В следующий раз отправьте как файл для лучшего качества\n\n"
+            "📸 Получено!\n"
+            "💡 В следующий раз — как файл\n"
             "⏳ Готовлю опции..."
         )
     elif message.document:
         document = message.document
         if not document.mime_type or not document.mime_type.startswith('image/'):
             await message.answer(
-                "❌ Отправьте файл изображения (JPG, PNG)",
+                "❌ Отправьте изображение",
                 reply_markup=get_cancel_keyboard()
             )
             return
         file_id = document.file_id
-        await message.answer("📁 Файл получен!\n⏳ Готовлю опции...")
+        await message.answer("📁 Файл получен!\n⏳ Готовлю...")
     else:
         await message.answer(
             "❌ Отправьте изображение",
@@ -571,15 +620,13 @@ async def handle_image(message: Message, state: FSMContext):
 
 @router.message(ImageProcessing.WAITING_IMAGE)
 async def handle_wrong_content(message: Message):
-    """Неправильный контент"""
     await message.answer(
-        "❌ Отправьте изображение (фото или файл)",
+        "❌ Отправьте изображение",
         reply_markup=get_cancel_keyboard()
     )
 
 @router.message()
 async def handle_any_message(message: Message):
-    """Любое другое сообщение"""
     await message.answer(
         "👋 Используйте /start",
         reply_markup=get_main_menu_keyboard()
@@ -589,7 +636,7 @@ async def handle_any_message(message: Message):
 
 async def main():
     """Запуск бота"""
-    global BOT_USERNAME  # Делаем переменную глобальной
+    global BOT_USERNAME
     
     print("=" * 60)
     print("🚀 Image to Sticker Pack Bot")
@@ -603,15 +650,15 @@ async def main():
     
     dp.include_router(router)
     
-    # Получаем информацию о боте (включая username)
+    # Получаем username автоматически
     bot_info = await bot.get_me()
-    BOT_USERNAME = bot_info.username  # АВТОМАТИЧЕСКИ получаем username!
+    BOT_USERNAME = bot_info.username
     
     print(f"🤖 Бот: @{bot_info.username}")
     print(f"🆔 ID: {bot_info.id}")
-    print(f"📝 Username для паков: {BOT_USERNAME}")
+    print(f"📝 Username: {BOT_USERNAME}")
     print("=" * 60)
-    print("✅ Бот запущен!")
+    print("✅ Запущен!")
     print("💡 Ctrl+C для остановки")
     print("=" * 60)
     
