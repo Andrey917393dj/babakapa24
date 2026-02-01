@@ -35,7 +35,7 @@ from PIL import Image
 
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-BOT_USERNAME = os.getenv('BOT_USERNAME', 'myimagebot')
+BOT_USERNAME = os.getenv('BOT_USERNAME', 'Crypto_test23_bot')
 
 if not BOT_TOKEN:
     print("❌ ОШИБКА: BOT_TOKEN не найден в .env файле!")
