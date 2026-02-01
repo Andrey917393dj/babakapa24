@@ -35,7 +35,6 @@ from PIL import Image
 
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-BOT_USERNAME = os.getenv('BOT_USERNAME', 'Crypto_test23_bot')
 
 if not BOT_TOKEN:
     print("❌ ОШИБКА: BOT_TOKEN не найден в .env файле!")
@@ -43,11 +42,8 @@ if not BOT_TOKEN:
     print("   BOT_TOKEN=ваш_токен_от_BotFather")
     sys.exit(1)
 
-if not BOT_USERNAME or BOT_USERNAME == 'myimagebot':
-    print("⚠️  ПРЕДУПРЕЖДЕНИЕ: BOT_USERNAME не настроен!")
-    print("📝 Добавьте в .env файл:")
-    print("   BOT_USERNAME=имя_вашего_бота")
-    print("")
+# BOT_USERNAME будет получен автоматически при запуске
+BOT_USERNAME = None
 
 # Настройка логирования
 logging.basicConfig(
@@ -593,6 +589,8 @@ async def handle_any_message(message: Message):
 
 async def main():
     """Запуск бота"""
+    global BOT_USERNAME  # Делаем переменную глобальной
+    
     print("=" * 60)
     print("🚀 Image to Sticker Pack Bot")
     print("=" * 60)
@@ -605,7 +603,10 @@ async def main():
     
     dp.include_router(router)
     
+    # Получаем информацию о боте (включая username)
     bot_info = await bot.get_me()
+    BOT_USERNAME = bot_info.username  # АВТОМАТИЧЕСКИ получаем username!
+    
     print(f"🤖 Бот: @{bot_info.username}")
     print(f"🆔 ID: {bot_info.id}")
     print(f"📝 Username для паков: {BOT_USERNAME}")
