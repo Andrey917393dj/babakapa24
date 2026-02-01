@@ -1,1793 +1,719 @@
+#!/usr/bin/env python3
 """
-Telegram Multi-Account Automation Bot v2.0
-Полностью улучшенная версия с исправлением всех критических проблем
+Telegram Image to Sticker Pack Bot
+Полностью рабочий код для конвертации изображений в стикерпаки
 """
 
 import asyncio
 import os
 import sys
-import base64
-import random
-import time
-import json
+import logging
 from datetime import datetime
-from typing import Callable, Dict, Any, Awaitable, Optional
+from typing import Optional
+from io import BytesIO
+import tempfile
+import shutil
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.types import (
+    Message, 
+    CallbackQuery, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton,
+    BufferedInputFile
+)
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-import aiosqlite
-from cryptography.fernet import Fernet
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from PIL import Image
 
 # ==================== КОНФИГУРАЦИЯ ====================
 
 load_dotenv()
-TOKEN = os.getenv('BOT_TOKEN')
-PASSWORD = "130290"  # ← ИЗМЕНИТЕ ПАРОЛЬ!
-DB_PATH = 'data/database.db'
-TARGET_BOT = '@ZnakomstvaAnonimniyChatBot'
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+BOT_USERNAME = os.getenv('BOT_USERNAME', 'myimagebot')
 
-if not TOKEN:
+if not BOT_TOKEN:
     print("❌ ОШИБКА: BOT_TOKEN не найден в .env файле!")
+    print("📝 Создайте файл .env со строкой:")
+    print("   BOT_TOKEN=ваш_токен_от_BotFather")
     sys.exit(1)
 
-print(f"🔐 Пароль для первого входа: {PASSWORD}")
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Константы
+STICKER_SIZE = 512  # Один размер должен быть 512px для Telegram
+GRID_SIZES = {
+    '3x4': (3, 4),
+    '4x6': (4, 6),
+    '5x8': (5, 8),
+    '7x9': (7, 9),
+    '9x11': (9, 11),
+}
 
 # ==================== FSM СОСТОЯНИЯ ====================
 
-class SystemSetup(StatesGroup):
-    PASSWORD = State()
-    API_ID = State()
-    API_HASH = State()
+class ImageProcessing(StatesGroup):
+    WAITING_IMAGE = State()
+    SELECTING_GRID = State()
 
-class AccountAuth(StatesGroup):
-    PHONE = State()
-    CODE = State()
-    PASSWORD = State()
+# ==================== ПРОЦЕССОР ИЗОБРАЖЕНИЙ ====================
 
-class TextSettings(StatesGroup):
-    ENTER_TEXT = State()
-
-class CooldownSettings(StatesGroup):
-    ENTER_VALUES = State()
-
-class TimeoutSettings(StatesGroup):
-    ENTER_TIMEOUT = State()
-
-class PatternSettings(StatesGroup):
-    EDIT_FIELD = State()
-
-class WorkerState:
-    IDLE = "idle"
-    SEARCHING = "searching"
-    IN_DIALOG = "in_dialog"
-    WAITING_REPLY = "waiting_reply"
-    PAUSED = "paused"
-    ERROR = "error"
-    STOPPED = "stopped"
-
-# ==================== ИНИЦИАЛИЗАЦИЯ БД ====================
-
-async def init_database(password: str):
-    os.makedirs('data', exist_ok=True)
-    os.makedirs('data/sessions', exist_ok=True)
-    os.makedirs('logs', exist_ok=True)
+class ImageProcessor:
+    """Обработка изображений для создания стикеров"""
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS system_config (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                password TEXT NOT NULL,
-                api_id TEXT,
-                api_hash TEXT,
-                admin_id INTEGER,
-                encryption_key TEXT NOT NULL,
-                is_initialized BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+    @staticmethod
+    def resize_and_crop(image: Image.Image, grid_cols: int, grid_rows: int) -> Image.Image:
+        """
+        Изменить размер и обрезать изображение под сетку
         
-        cursor = await db.execute("SELECT COUNT(*) FROM system_config")
-        count = (await cursor.fetchone())[0]
+        Args:
+            image: PIL Image объект
+            grid_cols: Количество колонок
+            grid_rows: Количество строк
+            
+        Returns:
+            Обработанное изображение
+        """
+        # Целевое соотношение сторон
+        target_ratio = grid_cols / grid_rows
+        current_ratio = image.width / image.height
         
-        if count == 0:
-            encryption_key = Fernet.generate_key().decode()
-            await db.execute("""
-                INSERT INTO system_config 
-                (id, password, encryption_key, is_initialized)
-                VALUES (1, ?, ?, FALSE)
-            """, (password, encryption_key))
+        # Определяем новые размеры
+        if current_ratio > target_ratio:
+            # Изображение шире - обрезаем ширину
+            new_height = image.height
+            new_width = int(new_height * target_ratio)
+        else:
+            # Изображение выше - обрезаем высоту
+            new_width = image.width
+            new_height = int(new_width / target_ratio)
         
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT UNIQUE NOT NULL,
-                session_data TEXT NOT NULL,
-                greeting_text TEXT DEFAULT 'Привет!',
-                cooldown_search INTEGER DEFAULT 20,
-                cooldown_send INTEGER DEFAULT 3,
-                cooldown_skip INTEGER DEFAULT 15,
-                timeout_reply INTEGER DEFAULT 90,
-                status TEXT DEFAULT 'idle',
-                is_active BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_active TIMESTAMP,
-                error_message TEXT
-            )
-        """)
+        # Центральная обрезка
+        left = (image.width - new_width) // 2
+        top = (image.height - new_height) // 2
+        right = left + new_width
+        bottom = top + new_height
         
-        # Добавляем колонку timeout_reply если её нет
+        cropped = image.crop((left, top, right, bottom))
+        
+        # Ресайз для высокого качества (каждый стикер будет 512px)
+        final_width = grid_cols * STICKER_SIZE
+        final_height = grid_rows * STICKER_SIZE
+        
+        resized = cropped.resize((final_width, final_height), Image.Resampling.LANCZOS)
+        
+        return resized
+    
+    @staticmethod
+    def slice_image(image: Image.Image, grid_cols: int, grid_rows: int) -> list[Image.Image]:
+        """
+        Разрезать изображение на сетку
+        
+        Args:
+            image: PIL Image для разрезки
+            grid_cols: Количество колонок
+            grid_rows: Количество строк
+            
+        Returns:
+            Список PIL Image объектов (слева-направо, сверху-вниз)
+        """
+        slice_width = image.width // grid_cols
+        slice_height = image.height // grid_rows
+        
+        slices = []
+        
+        # Итерация строка за строкой, слева направо
+        for row in range(grid_rows):
+            for col in range(grid_cols):
+                left = col * slice_width
+                top = row * slice_height
+                right = left + slice_width
+                bottom = top + slice_height
+                
+                slice_img = image.crop((left, top, right, bottom))
+                slices.append(slice_img)
+        
+        return slices
+    
+    @staticmethod
+    def prepare_sticker(image: Image.Image) -> BytesIO:
+        """
+        Конвертировать кусок изображения в формат стикера Telegram
+        
+        Args:
+            image: PIL Image объект
+            
+        Returns:
+            BytesIO объект с PNG данными
+        """
+        # Конвертация в RGBA для PNG с прозрачностью
+        if image.mode != 'RGBA':
+            image = image.convert('RGBA')
+        
+        # Ресайз до 512px на длинной стороне (должно быть уже 512x512)
+        width, height = image.size
+        if width > height:
+            new_width = STICKER_SIZE
+            new_height = int(height * (STICKER_SIZE / width))
+        else:
+            new_height = STICKER_SIZE
+            new_width = int(width * (STICKER_SIZE / height))
+        
+        image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Сохранение в BytesIO как PNG
+        output = BytesIO()
+        image.save(output, format='PNG', optimize=True)
+        output.seek(0)
+        
+        return output
+
+# ==================== МЕНЕДЖЕР СТИКЕРПАКОВ ====================
+
+class StickerPackManager:
+    """Управление созданием стикерпаков Telegram"""
+    
+    @staticmethod
+    def generate_pack_name(user_id: int) -> str:
+        """
+        Генерация уникального имени стикерпака
+        
+        Args:
+            user_id: Telegram ID пользователя
+            
+        Returns:
+            Уникальное имя пака
+        """
+        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        return f"u{user_id}_{timestamp}_by_{BOT_USERNAME}"
+    
+    @staticmethod
+    async def create_sticker_pack(
+        bot: Bot,
+        user_id: int,
+        pack_name: str,
+        pack_title: str,
+        stickers: list[BytesIO],
+    ) -> bool:
+        """
+        Создать новый стикерпак со всеми стикерами
+        
+        Процесс:
+        1. Создаём пак с первым стикером
+        2. Добавляем остальные стикеры по одному
+        3. Обрабатываем rate limits и ошибки
+        
+        Args:
+            bot: Telegram Bot объект
+            user_id: ID пользователя
+            pack_name: Уникальное имя пака
+            pack_title: Читаемое название
+            stickers: Список BytesIO объектов с PNG данными
+            
+        Returns:
+            True если успешно, False иначе
+        """
         try:
-            await db.execute("ALTER TABLE accounts ADD COLUMN timeout_reply INTEGER DEFAULT 90")
-        except:
-            pass
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS dialogs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_id INTEGER NOT NULL,
-                username TEXT,
-                user_id INTEGER,
-                first_message TEXT,
-                content_type TEXT,
-                outcome TEXT,
-                response_time REAL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (account_id) REFERENCES accounts(id)
+            # Шаг 1: Создаём стикерсет с первым стикером
+            first_sticker_data = stickers[0]
+            first_sticker_data.seek(0)
+            
+            first_sticker = BufferedInputFile(
+                first_sticker_data.read(),
+                filename="sticker.png"
             )
-        """)
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                dialog_id INTEGER NOT NULL,
-                sender_id INTEGER NOT NULL,
-                content TEXT,
-                content_type TEXT,
-                is_read BOOLEAN DEFAULT FALSE,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (dialog_id) REFERENCES dialogs(id)
+            
+            await bot.create_new_sticker_set(
+                user_id=user_id,
+                name=pack_name,
+                title=pack_title,
+                stickers=[{
+                    'sticker': first_sticker,
+                    'emoji_list': ['🖼️'],
+                    'format': 'static'
+                }]
             )
-        """)
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_id INTEGER NOT NULL,
-                date DATE NOT NULL,
-                total_dialogs INTEGER DEFAULT 0,
-                total_skips INTEGER DEFAULT 0,
-                total_replies INTEGER DEFAULT 0,
-                total_timeouts INTEGER DEFAULT 0,
-                avg_response_time REAL DEFAULT 0,
-                active_time_minutes INTEGER DEFAULT 0,
-                FOREIGN KEY (account_id) REFERENCES accounts(id),
-                UNIQUE(account_id, date)
-            )
-        """)
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_id INTEGER,
-                level TEXT,
-                message TEXT,
-                extra TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS bot_patterns (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                partner_found TEXT DEFAULT 'Нашёл собеседника!',
-                partner_skipped TEXT DEFAULT '🤚|||завершил диалог',
-                already_in_dialog TEXT DEFAULT '🔴|||недоступна в диалоге',
-                system_messages TEXT DEFAULT '🛑 Подпишись|||оставить отзыв'
-            )
-        """)
-        
-        cursor = await db.execute("SELECT COUNT(*) FROM bot_patterns")
-        count = (await cursor.fetchone())[0]
-        
-        if count == 0:
-            await db.execute("""
-                INSERT INTO bot_patterns (id, partner_found, partner_skipped, already_in_dialog, system_messages)
-                VALUES (1, 'Нашёл собеседника!', '🤚|||завершил диалог', '🔴|||недоступна в диалоге', '🛑 Подпишись|||оставить отзыв')
-            """)
-        
-        await db.commit()
-
-# ==================== УТИЛИТЫ ====================
-
-def get_status_emoji(status: str, is_active: bool) -> str:
-    if not is_active:
-        return "⚫"
-    status_map = {
-        'idle': '🔵', 'searching': '🟡', 'in_dialog': '🟢',
-        'waiting_reply': '🟠', 'paused': '⏸', 'error': '🔴', 'stopped': '⏹'
-    }
-    return status_map.get(status, '⚪')
-
-def get_status_text_ru(status: str) -> str:
-    status_map = {
-        'idle': 'Не активен', 'searching': 'Поиск собеседника', 'in_dialog': 'В диалоге',
-        'waiting_reply': 'Ожидание ответа', 'paused': 'На паузе', 'error': 'Ошибка', 'stopped': 'Остановлен'
-    }
-    return status_map.get(status, 'Неизвестно')
-
-async def log_to_db(account_id: int = None, level: str = "INFO", message: str = "", extra: dict = None):
-    """Структурированное логирование"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        extra_json = json.dumps(extra) if extra else None
-        await db.execute("""
-            INSERT INTO logs (account_id, level, message, extra, timestamp)
-            VALUES (?, ?, ?, ?, ?)
-        """, (account_id, level, message, extra_json, datetime.now()))
-        await db.commit()
-
-def encrypt_session(session_string: str, key: str) -> str:
-    fernet = Fernet(key.encode())
-    encrypted = fernet.encrypt(session_string.encode())
-    return base64.b64encode(encrypted).decode()
-
-def decrypt_session(encrypted_session: str, key: str) -> str:
-    fernet = Fernet(key.encode())
-    encrypted_bytes = base64.b64decode(encrypted_session.encode())
-    decrypted = fernet.decrypt(encrypted_bytes)
-    return decrypted.decode()
-
-async def update_account_status(account_id: int, status: str, error_message: str = None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            UPDATE accounts 
-            SET status = ?, last_active = ?, error_message = ?
-            WHERE id = ?
-        """, (status, datetime.now(), error_message, account_id))
-        await db.commit()
-
-async def is_system_initialized() -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT is_initialized FROM system_config WHERE id = 1")
-        result = await cursor.fetchone()
-        return result[0] if result else False
-
-async def get_admin_id() -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT admin_id FROM system_config WHERE id = 1")
-        result = await cursor.fetchone()
-        return result[0] if result else None
-
-async def verify_password(password: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT password FROM system_config WHERE id = 1")
-        result = await cursor.fetchone()
-        return result[0] == password if result else False
-
-async def get_system_config():
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT api_id, api_hash, encryption_key FROM system_config WHERE id = 1"
-        )
-        result = await cursor.fetchone()
-        return {
-            'api_id': int(result[0]),
-            'api_hash': result[1],
-            'encryption_key': result[2]
-        } if result else None
-
-# ==================== MIDDLEWARE ====================
-
-async def check_authorization_middleware(
-    handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
-    event: Message | CallbackQuery,
-    data: Dict[str, Any]
-) -> Any:
-    user_id = event.from_user.id
-    is_init = await is_system_initialized()
-    
-    # Для неинициализированной системы
-    if not is_init:
-        state = data.get('state')
-        current_state = await state.get_state() if state else None
-        
-        # Разрешаем только состояния настройки
-        allowed_states = [
-            SystemSetup.PASSWORD,
-            SystemSetup.API_ID,
-            SystemSetup.API_HASH
-        ]
-        
-        if current_state in allowed_states or \
-           (isinstance(event, Message) and event.text == "/start") or \
-           (isinstance(event, CallbackQuery) and event.data.startswith("init_")):
-            return await handler(event, data)
-        else:
-            text = "⚠️ Система не настроена. Завершите настройку или напишите /start"
-            if isinstance(event, Message):
-                await event.answer(text)
-            else:
-                await event.answer(text, show_alert=True)
-            return
-    
-    # Для инициализированной системы проверяем admin_id
-    admin_id = await get_admin_id()
-    if user_id != admin_id:
-        text = "🚫 У вас нет доступа к этому боту."
-        if isinstance(event, Message):
-            await event.answer(text)
-        else:
-            await event.answer(text, show_alert=True)
-        return
-    
-    return await handler(event, data)
+            
+            logger.info(f"Создан стикерпак: {pack_name}")
+            
+            # Шаг 2: Добавляем остальные стикеры по одному
+            # ВАЖНО: У Telegram есть rate limits, поэтому добавляем задержку
+            for idx, sticker_data in enumerate(stickers[1:], start=2):
+                try:
+                    # Сброс указателя файла
+                    sticker_data.seek(0)
+                    
+                    sticker = BufferedInputFile(
+                        sticker_data.read(),
+                        filename=f"sticker_{idx}.png"
+                    )
+                    
+                    await bot.add_sticker_to_set(
+                        user_id=user_id,
+                        name=pack_name,
+                        sticker={
+                            'sticker': sticker,
+                            'emoji_list': ['🖼️'],
+                            'format': 'static'
+                        }
+                    )
+                    
+                    # Небольшая задержка для избежания rate limits (50ms)
+                    await asyncio.sleep(0.05)
+                    
+                    logger.info(f"Добавлен стикер {idx}/{len(stickers)} в пак {pack_name}")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка добавления стикера {idx}: {e}")
+                    # Продолжаем с остальными стикерами даже если один не прошёл
+                    continue
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания стикерпака: {e}")
+            return False
 
 # ==================== КЛАВИАТУРЫ ====================
 
-def get_main_menu_keyboard(has_accounts: bool = False) -> InlineKeyboardMarkup:
-    if not has_accounts:
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="add_account")],
-            [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings_menu")]
-        ])
-    
+def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Главное меню бота"""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="⏸ Пауза всех", callback_data="pause_all"),
-            InlineKeyboardButton(text="▶️ Запустить всех", callback_data="start_all")
-        ],
-        [InlineKeyboardButton(text="⏹ Стоп всех", callback_data="stop_all")],
-        [
-            InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="add_account"),
-            InlineKeyboardButton(text="📋 Аккаунты", callback_data="accounts_list")
-        ],
-        [
-            InlineKeyboardButton(text="📝 Тексты", callback_data="set_texts"),
-            InlineKeyboardButton(text="⏱ Задержки", callback_data="set_cooldowns")
-        ],
-        [
-            InlineKeyboardButton(text="⏰ Таймауты", callback_data="set_timeouts"),
-            InlineKeyboardButton(text="🔤 Паттерны", callback_data="set_patterns")
-        ],
-        [
-            InlineKeyboardButton(text="📊 Статистика", callback_data="stats_menu"),
-            InlineKeyboardButton(text="📄 Логи", callback_data="logs_menu")
-        ]
+        [InlineKeyboardButton(text="📸 Загрузить изображение", callback_data="upload_image")],
+        [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="show_help")]
     ])
 
-# ==================== ВОРКЕР ====================
+def get_grid_size_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора размера сетки"""
+    keyboard = []
+    row = []
+    
+    for idx, (size_label, (cols, rows)) in enumerate(GRID_SIZES.items()):
+        total_stickers = cols * rows
+        button = InlineKeyboardButton(
+            text=f"{size_label} ({total_stickers} стикеров)",
+            callback_data=f"grid_{size_label}"
+        )
+        row.append(button)
+        
+        # Создаём новую строку после каждых 2 кнопок
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    
+    # Добавляем оставшиеся кнопки
+    if row:
+        keyboard.append(row)
+    
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-class AccountWorker:
-    def __init__(self, account_id: int, client: TelegramClient, greeting: str, 
-                 cd_search: int, cd_send: int, cd_skip: int, timeout_reply: int,
-                 bot: Bot, admin_id: int):
-        self.account_id = account_id
-        self.client = client
-        self.greeting = greeting
-        self.cd_search = cd_search
-        self.cd_send = cd_send
-        self.cd_skip = cd_skip
-        self.timeout_reply = timeout_reply
-        self.bot = bot
-        self.admin_id = admin_id
-        
-        self.state = WorkerState.IDLE
-        self.is_running = True
-        self.timer_task = None
-        self._shutdown_event = asyncio.Event()
-        
-        # Метрики
-        self.metrics = {
-            'dialogs_started': 0,
-            'replies_received': 0,
-            'avg_response_time': 0,
-            'errors_count': 0,
-            'skips': 0,
-            'timeouts': 0
-        }
-        self.dialog_start_time = None
-        self.my_user_id = None
-    
-    async def start(self):
-        try:
-            await self.client.connect()
-            
-            # Получаем свой ID
-            me = await self.client.get_me()
-            self.my_user_id = me.id
-            
-            await log_to_db(self.account_id, "INFO", "Подключение установлено", 
-                          extra={'user_id': self.my_user_id})
-            
-            @self.client.on(events.NewMessage(chats=TARGET_BOT))
-            async def message_handler(event):
-                await self.handle_message(event)
-            
-            await self.search_dialog()
-            
-            # Graceful shutdown
-            while self.is_running:
-                try:
-                    await asyncio.wait_for(
-                        self._shutdown_event.wait(),
-                        timeout=1.0
-                    )
-                    break
-                except asyncio.TimeoutError:
-                    continue
-        
-        except asyncio.CancelledError:
-            await log_to_db(self.account_id, "WARNING", "Принудительная остановка")
-        except Exception as e:
-            await log_to_db(self.account_id, "ERROR", f"Критическая ошибка: {e}")
-            await update_account_status(self.account_id, WorkerState.ERROR, str(e))
-            self.metrics['errors_count'] += 1
-        finally:
-            if self.client.is_connected():
-                try:
-                    await asyncio.wait_for(
-                        self.client.disconnect(),
-                        timeout=5.0
-                    )
-                    await log_to_db(self.account_id, "INFO", "Отключение завершено")
-                except asyncio.TimeoutError:
-                    await log_to_db(self.account_id, "WARNING", "Таймаут отключения")
-    
-    async def search_dialog(self, retry_count=0):
-        if not self.is_running or self.state == WorkerState.PAUSED:
-            return
-        
-        self.state = WorkerState.SEARCHING
-        await update_account_status(self.account_id, WorkerState.SEARCHING)
-        await log_to_db(self.account_id, "INFO", "🔍 Начало поиска")
-        
-        delay = self.cd_search + random.randint(-5, 5)
-        await asyncio.sleep(max(1, delay))
-        
-        try:
-            await self.client.send_message(TARGET_BOT, '/search')
-            await log_to_db(self.account_id, "INFO", "📤 /search отправлен")
-        
-        except FloodWaitError as e:
-            wait_time = e.seconds
-            await log_to_db(self.account_id, "WARNING", 
-                          f"FloodWait: {wait_time} сек", 
-                          extra={'wait_seconds': wait_time})
-            await asyncio.sleep(wait_time)
-            await self.search_dialog(retry_count)
-        
-        except Exception as e:
-            await log_to_db(self.account_id, "ERROR", f"Ошибка /search: {e}")
-            self.metrics['errors_count'] += 1
-            
-            if retry_count < 3:
-                await log_to_db(self.account_id, "INFO", 
-                              f"Повтор через 10 сек (попытка {retry_count + 1}/3)")
-                await asyncio.sleep(10)
-                await self.search_dialog(retry_count + 1)
-            else:
-                self.state = WorkerState.ERROR
-                await update_account_status(self.account_id, WorkerState.ERROR, str(e))
-    
-    async def handle_message(self, event):
-        text = event.message.message if event.message.message else ""
-        sender = await event.message.get_sender()
-        
-        # Игнорируем свои сообщения
-        if sender and sender.id == self.my_user_id:
-            return
-        
-        await log_to_db(self.account_id, "INFO", f"📨 Получено: {text[:50]}...",
-                       extra={'sender_id': sender.id if sender else None})
-        
-        # Получение паттернов
-        patterns = await self.get_patterns()
-        
-        # 1. НАИВЫСШИЙ ПРИОРИТЕТ: Системные сообщения
-        if any(p in text for p in patterns['system_messages']):
-            await log_to_db(self.account_id, "INFO", "Системное сообщение (игнор)")
-            return
-        
-        # 2. Уже в диалоге
-        if any(p in text for p in patterns['already_in_dialog']):
-            await log_to_db(self.account_id, "WARNING", "Уже в диалоге")
-            return
-        
-        # 3. Собеседник найден
-        if any(p in text for p in patterns['partner_found']):
-            await self.on_partner_found()
-            return
-        
-        # 4. Собеседник скипнул
-        if any(p in text for p in patterns['partner_skipped']):
-            await self.on_partner_skipped()
-            return
-        
-        # 5. Ответ собеседника (ТОЛЬКО в состоянии ожидания)
-        if self.state == WorkerState.WAITING_REPLY:
-            # Проверяем, что это не бот и есть контент
-            if sender and not sender.bot:
-                if text.strip() or event.message.photo or event.message.sticker or event.message.voice:
-                    await self.on_partner_replied(event.message)
-                    return
-        
-        # 6. Неизвестное сообщение
-        await log_to_db(self.account_id, "WARNING", f"Неизвестное: {text[:50]}")
-    
-    async def get_patterns(self):
-        """Получить паттерны из БД"""
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT * FROM bot_patterns WHERE id = 1")
-            result = await cursor.fetchone()
-            
-            if result:
-                return {
-                    'partner_found': result[1].split('|||'),
-                    'partner_skipped': result[2].split('|||'),
-                    'already_in_dialog': result[3].split('|||'),
-                    'system_messages': result[4].split('|||')
-                }
-            else:
-                return {
-                    'partner_found': ['Нашёл собеседника!'],
-                    'partner_skipped': ['🤚', 'завершил диалог'],
-                    'already_in_dialog': ['🔴', 'недоступна в диалоге'],
-                    'system_messages': ['🛑 Подпишись', 'оставить отзыв']
-                }
-    
-    async def on_partner_found(self):
-        self.state = WorkerState.IN_DIALOG
-        self.dialog_start_time = time.time()
-        self.metrics['dialogs_started'] += 1
-        
-        await update_account_status(self.account_id, WorkerState.IN_DIALOG)
-        await log_to_db(self.account_id, "INFO", "✅ Собеседник найден")
-        
-        delay = self.cd_send + random.uniform(-1, 1)
-        await asyncio.sleep(max(0.5, delay))
-        
-        try:
-            await self.client.send_message(TARGET_BOT, self.greeting)
-            await log_to_db(self.account_id, "INFO", f"📤 Отправлен текст: {self.greeting}")
-            
-            self.state = WorkerState.WAITING_REPLY
-            await update_account_status(self.account_id, WorkerState.WAITING_REPLY)
-            
-            if self.timer_task:
-                self.timer_task.cancel()
-            self.timer_task = asyncio.create_task(self.inactivity_timer())
-            
-        except FloodWaitError as e:
-            await log_to_db(self.account_id, "WARNING", 
-                          f"FloodWait при отправке: {e.seconds} сек")
-            await asyncio.sleep(e.seconds)
-        except Exception as e:
-            await log_to_db(self.account_id, "ERROR", f"Ошибка отправки: {e}")
-            self.metrics['errors_count'] += 1
-    
-    async def on_partner_skipped(self):
-        self.metrics['skips'] += 1
-        await log_to_db(self.account_id, "INFO", "⏭ Собеседник скипнул")
-        
-        if self.timer_task:
-            self.timer_task.cancel()
-        
-        delay = self.cd_skip + random.randint(-3, 3)
-        await asyncio.sleep(max(1, delay))
-        await self.search_dialog()
-    
-    async def on_partner_replied(self, message):
-        if self.timer_task:
-            self.timer_task.cancel()
-        
-        # Вычисляем время ответа
-        response_time = None
-        if self.dialog_start_time:
-            response_time = time.time() - self.dialog_start_time
-            
-            # Обновляем среднее время
-            n = self.metrics['replies_received']
-            old_avg = self.metrics['avg_response_time']
-            self.metrics['avg_response_time'] = (old_avg * n + response_time) / (n + 1)
-        
-        self.metrics['replies_received'] += 1
-        
-        # Определяем тип контента
-        if message.text:
-            content_type = "текст"
-            content = message.text
-        elif message.photo:
-            content_type = "фото"
-            content = "[Фото]"
-        elif message.sticker:
-            content_type = "стикер"
-            content = "[Стикер]"
-        elif message.voice:
-            content_type = "голосовое"
-            content = "[Голосовое]"
-        else:
-            content_type = "медиа"
-            content = "[Медиа]"
-        
-        sender = await message.get_sender()
-        username = sender.username if sender and sender.username else "Нет username"
-        user_id = sender.id if sender else 0
-        
-        await log_to_db(self.account_id, "INFO", f"📩 Ответ: {content_type}",
-                       extra={
-                           'username': username,
-                           'user_id': user_id,
-                           'content_type': content_type,
-                           'response_time': response_time
-                       })
-        
-        # Сохраняем в БД
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("""
-                INSERT INTO dialogs (account_id, username, user_id, first_message, content_type, outcome, response_time)
-                VALUES (?, ?, ?, ?, ?, 'replied', ?)
-            """, (self.account_id, username, user_id, content, content_type, response_time))
-            await db.commit()
-        
-        # Уведомляем админа
-        await self.notify_admin_reply(username, user_id, content, content_type, response_time)
-        
-        # Продолжаем ждать (может быть ещё сообщения)
-        if self.state == WorkerState.WAITING_REPLY:
-            self.timer_task = asyncio.create_task(self.inactivity_timer())
-    
-    async def inactivity_timer(self):
-        try:
-            await asyncio.sleep(self.timeout_reply)
-            
-            if self.state == WorkerState.WAITING_REPLY:
-                self.metrics['timeouts'] += 1
-                await log_to_db(self.account_id, "WARNING", 
-                              f"⏰ Таймаут {self.timeout_reply} сек")
-                self.state = WorkerState.PAUSED
-                await update_account_status(self.account_id, WorkerState.PAUSED)
-                await self.notify_admin_timeout()
-        except asyncio.CancelledError:
-            pass
-    
-    async def notify_admin_reply(self, username: str, user_id: int, content: str, 
-                                content_type: str, response_time: Optional[float]):
-        time_str = f"{response_time:.1f} сек" if response_time else "N/A"
-        
-        text = f"""
-💬 Аккаунт {self.account_id}: Собеседник ответил!
+def get_cancel_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура отмены"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+    ])
 
-👤 Username: @{username}
-🆔 User ID: {user_id}
-💬 Тип: {content_type}
-📝 Сообщение: {content[:100]}
-⏱ Время ответа: {time_str}
-⏰ Время: {datetime.now().strftime('%H:%M:%S')}
+# ==================== РОУТЕРЫ ====================
 
-⚠️ Бот продолжает работать
-"""
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⏸ Остановить диалог", callback_data=f"worker_stop_dialog_{self.account_id}")],
-            [InlineKeyboardButton(text="⏭ Скип и продолжить", callback_data=f"worker_skip_{self.account_id}")],
-            [InlineKeyboardButton(text="📊 Главное меню", callback_data="main_menu")]
-        ])
-        
-        try:
-            await self.bot.send_message(self.admin_id, text, reply_markup=keyboard)
-        except Exception as e:
-            await log_to_db(self.account_id, "ERROR", f"Ошибка уведомления: {e}")
-    
-    async def notify_admin_timeout(self):
-        text = f"""
-⏰ Аккаунт {self.account_id}: Таймаут {self.timeout_reply} сек
+router = Router()
 
-Собеседник не ответил. Что делать?
-"""
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⏭ Скип", callback_data=f"worker_skip_{self.account_id}")],
-            [InlineKeyboardButton(text="⏳ Ждать ещё", callback_data=f"worker_wait_{self.account_id}")],
-            [InlineKeyboardButton(text="📊 Главное меню", callback_data="main_menu")]
-        ])
-        
-        try:
-            await self.bot.send_message(self.admin_id, text, reply_markup=keyboard)
-        except Exception as e:
-            await log_to_db(self.account_id, "ERROR", f"Ошибка уведомления: {e}")
-    
-    async def skip_dialog(self):
-        try:
-            await self.client.send_message(TARGET_BOT, '/next')
-            await log_to_db(self.account_id, "INFO", "Отправлен /next")
-            await asyncio.sleep(2)
-            self.state = WorkerState.IDLE
-            await self.search_dialog()
-        except Exception as e:
-            await log_to_db(self.account_id, "ERROR", f"Ошибка /next: {e}")
-            self.metrics['errors_count'] += 1
-    
-    async def wait_more(self):
-        self.state = WorkerState.WAITING_REPLY
-        await update_account_status(self.account_id, WorkerState.WAITING_REPLY)
-        
-        if self.timer_task:
-            self.timer_task.cancel()
-        self.timer_task = asyncio.create_task(self.inactivity_timer())
-        await log_to_db(self.account_id, "INFO", "⏳ Ожидание продолжено")
-    
-    async def resume(self):
-        self.state = WorkerState.IDLE
-        await self.search_dialog()
-    
-    async def pause(self):
-        self.state = WorkerState.PAUSED
-        await update_account_status(self.account_id, WorkerState.PAUSED)
-        if self.timer_task:
-            self.timer_task.cancel()
-    
-    async def stop(self):
-        self.is_running = False
-        self.state = WorkerState.STOPPED
-        await update_account_status(self.account_id, WorkerState.STOPPED)
-        if self.timer_task:
-            self.timer_task.cancel()
-        self._shutdown_event.set()
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
 
-# ==================== МЕНЕДЖЕР ВОРКЕРОВ ====================
-
-class WorkerManager:
-    def __init__(self):
-        self.workers: Dict[int, tuple[AccountWorker, asyncio.Task]] = {}
-        self._locks: Dict[int, asyncio.Lock] = {}
-    
-    def _get_lock(self, account_id: int) -> asyncio.Lock:
-        """Получить lock для аккаунта (thread-safe)"""
-        if account_id not in self._locks:
-            self._locks[account_id] = asyncio.Lock()
-        return self._locks[account_id]
-    
-    async def start_worker(self, account_id: int, bot: Bot) -> bool:
-        client = None
-        try:
-            async with self._get_lock(account_id):
-                if account_id in self.workers:
-                    return False
-                
-                config = await get_system_config()
-                admin_id = await get_admin_id()
-                if not config or not admin_id:
-                    return False
-                
-                async with aiosqlite.connect(DB_PATH) as db:
-                    cursor = await db.execute("""
-                        SELECT phone, session_data, greeting_text, cooldown_search, 
-                               cooldown_send, cooldown_skip, timeout_reply
-                        FROM accounts WHERE id = ?
-                    """, (account_id,))
-                    account = await cursor.fetchone()
-                
-                if not account:
-                    return False
-                
-                phone, encrypted_session, greeting, cd_search, cd_send, cd_skip, timeout_reply = account
-                session_string = decrypt_session(encrypted_session, config['encryption_key'])
-                
-                client = TelegramClient(
-                    StringSession(session_string),
-                    config['api_id'],
-                    config['api_hash']
-                )
-                
-                # Подключаемся сразу для проверки
-                await client.connect()
-                
-                worker = AccountWorker(
-                    account_id, client, greeting, cd_search, cd_send, cd_skip, 
-                    timeout_reply, bot, admin_id
-                )
-                task = asyncio.create_task(worker.start())
-                
-                self.workers[account_id] = (worker, task)
-                await log_to_db(account_id, "INFO", "Воркер запущен")
-                return True
-        
-        except Exception as e:
-            if client and client.is_connected():
-                await client.disconnect()
-            await log_to_db(account_id, "ERROR", f"Ошибка запуска воркера: {e}")
-            return False
-    
-    async def stop_worker(self, account_id: int) -> bool:
-        async with self._get_lock(account_id):
-            if account_id in self.workers:
-                worker, task = self.workers[account_id]
-                await worker.stop()
-                
-                try:
-                    await asyncio.wait_for(task, timeout=10.0)
-                except asyncio.TimeoutError:
-                    task.cancel()
-                    await log_to_db(account_id, "WARNING", "Принудительная остановка по таймауту")
-                
-                del self.workers[account_id]
-                await log_to_db(account_id, "INFO", "Воркер остановлен")
-                return True
-            return False
-    
-    async def get_worker(self, account_id: int) -> Optional[AccountWorker]:
-        if account_id in self.workers:
-            return self.workers[account_id][0]
-        return None
-    
-    async def pause_all_workers(self):
-        for account_id in list(self.workers.keys()):
-            worker = await self.get_worker(account_id)
-            if worker:
-                await worker.pause()
-    
-    async def resume_all_workers(self):
-        for account_id in list(self.workers.keys()):
-            worker = await self.get_worker(account_id)
-            if worker and worker.state == WorkerState.PAUSED:
-                await worker.resume()
-    
-    async def stop_all_workers(self):
-        account_ids = list(self.workers.keys())
-        for account_id in account_ids:
-            await self.stop_worker(account_id)
-
-worker_manager = WorkerManager()
-
-# ==================== ОБРАБОТЧИКИ ====================
-
-router_init = Router()
-router_start = Router()
-router_accounts = Router()
-router_settings = Router()
-router_control = Router()
-router_stats = Router()
-router_logs = Router()
-
-# ==================== ИНИЦИАЛИЗАЦИЯ ====================
-
-@router_init.message(Command("start"))
+@router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
+    """Обработчик команды /start"""
     await state.clear()
     
-    is_init = await is_system_initialized()
-    
-    if not is_init:
-        text = "🔐 АВТОРИЗАЦИЯ\n\nДля доступа к боту введите пароль:"
-        await message.answer(text)
-        await state.set_state(SystemSetup.PASSWORD)
-    else:
-        await show_main_menu(message)
+    welcome_text = """
+👋 Добро пожаловать в Image to Sticker Pack Bot!
 
-@router_init.message(SystemSetup.PASSWORD)
-async def process_password(message: Message, state: FSMContext):
-    password = message.text.strip()
-    
-    try:
-        await message.delete()
-    except:
-        pass
-    
-    if await verify_password(password):
-        text = """
-✅ Пароль верный!
+📸 Я конвертирую ваши изображения в стикерпаки, которые вы можете использовать для создания мозаичных эффектов в чатах!
 
-🔧 ПЕРВИЧНАЯ НАСТРОЙКА
+💡 Как использовать:
+1️⃣ Отправьте мне изображение
+2️⃣ Выберите размер сетки
+3️⃣ Получите готовый стикерпак
+4️⃣ Используйте стикеры в чатах!
 
-1️⃣ Получите API_ID и API_HASH:
-   • https://my.telegram.org
-   • API development tools
-   • Создайте приложение
+✨ Функции:
+• Бесплатно и без ограничений
+• Несколько размеров сетки (от 3x4 до 9x11)
+• Высокое качество изображений
+• Быстрая обработка
 
-2️⃣ ID определится автоматически
+🚀 Готовы начать?
 """
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📝 Начать настройку", callback_data="init_start")]
-        ])
-        await message.answer(text, reply_markup=keyboard)
-        await state.clear()
-    else:
-        await message.answer("❌ Неверный пароль. Попробуйте ещё раз:")
-
-@router_init.callback_query(F.data == "init_start")
-async def init_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("📱 Шаг 1/2: Введите API_ID (число)\n\nПример: 12345678")
-    await state.set_state(SystemSetup.API_ID)
-    await callback.answer()
-
-@router_init.message(SystemSetup.API_ID)
-async def process_api_id(message: Message, state: FSMContext):
-    api_id = message.text.strip()
     
-    if not api_id.isdigit():
-        await message.answer("❌ API_ID должен быть числом. Попробуйте ещё раз:")
-        return
-    
-    await state.update_data(api_id=api_id)
-    await message.answer("🔐 Шаг 2/2: Введите API_HASH\n\nПример: abcdef1234567890abcdef1234567890")
-    await state.set_state(SystemSetup.API_HASH)
+    await message.answer(welcome_text, reply_markup=get_main_menu_keyboard())
 
-@router_init.message(SystemSetup.API_HASH)
-async def process_api_hash(message: Message, state: FSMContext):
-    api_hash = message.text.strip()
-    
-    if len(api_hash) < 32:
-        await message.answer("❌ API_HASH слишком короткий. Попробуйте ещё раз:")
-        return
-    
-    data = await state.get_data()
-    api_id = data['api_id']
-    admin_id = message.from_user.id
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            UPDATE system_config 
-            SET api_id = ?, api_hash = ?, admin_id = ?, is_initialized = TRUE, updated_at = CURRENT_TIMESTAMP
-            WHERE id = 1
-        """, (api_id, api_hash, admin_id))
-        await db.commit()
-    
-    await message.answer(
-        f"✅ Настройка завершена!\n\n"
-        f"📋 Данные сохранены:\n"
-        f"├ API_ID: {api_id}\n"
-        f"├ API_HASH: {api_hash[:8]}...{api_hash[-4:]}\n"
-        f"└ Admin ID: {admin_id}"
-    )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="add_account")],
-        [InlineKeyboardButton(text="📊 Главное меню", callback_data="main_menu")]
-    ])
-    
-    await message.answer("Что дальше?", reply_markup=keyboard)
-    await state.clear()
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    """Обработчик команды /help"""
+    help_text = """
+ℹ️ ПОМОЩЬ
 
-# ==================== ГЛАВНОЕ МЕНЮ ====================
+📋 Как использовать бота:
 
-async def get_accounts_status():
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id, phone, status, is_active FROM accounts ORDER BY id")
-        return await cursor.fetchall()
+1️⃣ Отправьте изображение
+   • Как файл (лучше качество)
+   • Или как фото
 
-async def show_main_menu(message: Message):
-    accounts = await get_accounts_status()
+2️⃣ Выберите размер сетки:
+   • 3x4 = 12 стикеров
+   • 4x6 = 24 стикера
+   • 5x8 = 40 стикеров
+   • 7x9 = 63 стикера
+   • 9x11 = 99 стикеров
+
+3️⃣ Дождитесь обработки
+   • Обычно занимает 30-60 секунд
+
+4️⃣ Добавьте стикерпак в Telegram
+   • Кликните на ссылку
+   • Используйте стикеры по порядку
+
+💡 Советы:
+• Отправляйте изображения как файлы для лучшего качества
+• Большие изображения работают лучше
+• Минимальный размер: 512px на меньшей стороне
+
+❓ Проблемы?
+• /start - начать заново
+• /cancel - отменить текущую операцию
+"""
     
-    if not accounts:
-        status_text = "📊 Статус работы:\n\n❌ Аккаунты не добавлены\n\nДобавьте хотя бы один аккаунт."
-        keyboard = get_main_menu_keyboard(has_accounts=False)
-    else:
-        status_text = "📊 Статус работы:\n\n"
-        for acc_id, phone, status, is_active in accounts:
-            emoji = get_status_emoji(status, is_active)
-            status_ru = get_status_text_ru(status)
-            phone_masked = f"{phone[:4]}***{phone[-3:]}" if len(phone) > 7 else phone
-            status_text += f"{emoji} Аккаунт {acc_id} ({phone_masked}): {status_ru}\n"
-        keyboard = get_main_menu_keyboard(has_accounts=True)
-    
-    await message.answer(status_text, reply_markup=keyboard)
+    await message.answer(help_text, reply_markup=get_main_menu_keyboard())
 
-@router_start.callback_query(F.data == "main_menu")
-async def callback_main_menu(callback: CallbackQuery):
-    await callback.message.delete()
-    await show_main_menu(callback.message)
-    await callback.answer()
-
-# ==================== АККАУНТЫ ====================
-
-@router_accounts.callback_query(F.data == "add_account")
-async def add_account_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("📱 Введите номер телефона\n\nФормат: +79991234567")
-    await state.set_state(AccountAuth.PHONE)
-    await callback.answer()
-
-@router_accounts.message(Command("cancel"))
-async def cancel_auth(message: Message, state: FSMContext):
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    """Обработчик команды /cancel"""
     current_state = await state.get_state()
-    if current_state:
-        await state.clear()
-        await message.answer("❌ Операция отменена")
-        await show_main_menu(message)
-
-@router_accounts.message(AccountAuth.PHONE)
-async def process_phone(message: Message, state: FSMContext):
-    phone = message.text.strip()
     
-    if not phone.startswith('+') or not phone[1:].isdigit():
-        await message.answer("❌ Неверный формат. Пример: +79991234567\n\nОтменить: /cancel")
+    if current_state is None:
+        await message.answer("❌ Нечего отменять", reply_markup=get_main_menu_keyboard())
         return
     
-    config = await get_system_config()
-    if not config:
-        await message.answer("❌ Конфигурация не найдена")
-        await state.clear()
-        return
-    
-    client = TelegramClient(StringSession(), config['api_id'], config['api_hash'])
-    
-    try:
-        await client.connect()
-        await client.send_code_request(phone)
-        
-        await state.update_data(phone=phone, client=client, encryption_key=config['encryption_key'])
-        await message.answer("🔐 Введите код из SMS\n\nОтменить: /cancel")
-        await state.set_state(AccountAuth.CODE)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-        await client.disconnect()
-
-@router_accounts.message(AccountAuth.CODE)
-async def process_code(message: Message, state: FSMContext):
-    code = message.text.strip().replace('-', '').replace(' ', '')
-    data = await state.get_data()
-    
-    client = data['client']
-    phone = data['phone']
-    
-    try:
-        await client.sign_in(phone, code)
-        
-        if not await client.is_user_authorized():
-            await message.answer("🔒 Введите пароль 2FA\n\nОтменить: /cancel")
-            await state.set_state(AccountAuth.PASSWORD)
-            return
-        
-        await save_account_session(client, phone, data['encryption_key'])
-        await message.answer(f"✅ Аккаунт {phone} добавлен!")
-        
-        await client.disconnect()
-        await state.clear()
-        await show_main_menu(message)
-        
-    except SessionPasswordNeededError:
-        await message.answer("🔒 Введите пароль 2FA\n\nОтменить: /cancel")
-        await state.set_state(AccountAuth.PASSWORD)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-        await client.disconnect()
-
-@router_accounts.message(AccountAuth.PASSWORD)
-async def process_2fa_password(message: Message, state: FSMContext):
-    password = message.text.strip()
-    data = await state.get_data()
-    
-    client = data['client']
-    phone = data['phone']
-    
-    try:
-        await client.sign_in(password=password)
-        await save_account_session(client, phone, data['encryption_key'])
-        await message.answer(f"✅ Аккаунт {phone} добавлен!")
-        
-        await client.disconnect()
-        await state.clear()
-        await show_main_menu(message)
-    except Exception as e:
-        await message.answer(f"❌ Неверный пароль: {e}")
-
-async def save_account_session(client: TelegramClient, phone: str, encryption_key: str):
-    session_string = client.session.save()
-    encrypted_session = encrypt_session(session_string, encryption_key)
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO accounts (phone, session_data) VALUES (?, ?)", 
-                        (phone, encrypted_session))
-        await db.commit()
-    
-    await log_to_db(None, "INFO", f"Добавлен аккаунт: {phone}")
-
-@router_accounts.callback_query(F.data == "accounts_list")
-async def accounts_list(callback: CallbackQuery):
-    accounts = await get_accounts_status()
-    
-    if not accounts:
-        await callback.answer("❌ Аккаунты не добавлены", show_alert=True)
-        return
-    
-    text = "📋 СПИСОК АККАУНТОВ:\n\n"
-    buttons = []
-    
-    for acc_id, phone, status, is_active in accounts:
-        emoji = get_status_emoji(status, is_active)
-        status_ru = get_status_text_ru(status)
-        phone_masked = f"{phone[:4]}***{phone[-3:]}"
-        text += f"{emoji} Аккаунт {acc_id}\n   Номер: {phone_masked}\n   Статус: {status_ru}\n\n"
-        
-        buttons.append([InlineKeyboardButton(text=f"{emoji} Аккаунт {acc_id}", 
-                                            callback_data=f"account_detail_{acc_id}")])
-    
-    buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
-
-@router_accounts.callback_query(F.data.startswith("account_detail_"))
-async def account_detail(callback: CallbackQuery):
-    account_id = int(callback.data.split("_")[2])
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("""
-            SELECT phone, status, greeting_text, cooldown_search, cooldown_send, 
-                   cooldown_skip, timeout_reply, is_active, last_active, error_message
-            FROM accounts WHERE id = ?
-        """, (account_id,))
-        account = await cursor.fetchone()
-    
-    if not account:
-        await callback.answer("❌ Аккаунт не найден", show_alert=True)
-        return
-    
-    phone, status, greeting, cd_search, cd_send, cd_skip, timeout_reply, is_active, last_active, error = account
-    status_ru = get_status_text_ru(status)
-    is_running = account_id in worker_manager.workers
-    
-    text = f"📱 АККАУНТ {account_id}\n\n"
-    text += f"Номер: {phone}\n"
-    text += f"Статус: {status_ru}\n"
-    text += f"Воркер: {'🟢 Запущен' if is_running else '⚫ Остановлен'}\n\n"
-    text += f"📝 Текст: {greeting}\n\n"
-    text += f"⏱ Задержки:\n├ Поиск: {cd_search} сек\n├ Отправка: {cd_send} сек\n└ Скип: {cd_skip} сек\n\n"
-    text += f"⏰ Таймаут ответа: {timeout_reply} сек\n"
-    
-    if error:
-        text += f"\n❌ Ошибка: {error}\n"
-    
-    buttons = []
-    if is_running:
-        buttons.append([InlineKeyboardButton(text="⏹ Остановить", 
-                                            callback_data=f"stop_worker_{account_id}")])
-    else:
-        buttons.append([InlineKeyboardButton(text="▶️ Запустить", 
-                                            callback_data=f"start_worker_{account_id}")])
-    
-    buttons.append([InlineKeyboardButton(text="🗑 Удалить", 
-                                        callback_data=f"delete_account_{account_id}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="accounts_list")])
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
-
-@router_accounts.callback_query(F.data.startswith("start_worker_"))
-async def start_worker(callback: CallbackQuery):
-    account_id = int(callback.data.split("_")[2])
-    success = await worker_manager.start_worker(account_id, callback.bot)
-    
-    if success:
-        await callback.answer("✅ Воркер запущен", show_alert=True)
-    else:
-        await callback.answer("❌ Не удалось запустить", show_alert=True)
-    
-    await account_detail(callback)
-
-@router_accounts.callback_query(F.data.startswith("stop_worker_"))
-async def stop_worker(callback: CallbackQuery):
-    account_id = int(callback.data.split("_")[2])
-    success = await worker_manager.stop_worker(account_id)
-    
-    if success:
-        await callback.answer("✅ Воркер остановлен", show_alert=True)
-    else:
-        await callback.answer("❌ Воркер не был запущен", show_alert=True)
-    
-    await account_detail(callback)
-
-@router_accounts.callback_query(F.data.startswith("delete_account_"))
-async def delete_account(callback: CallbackQuery):
-    account_id = int(callback.data.split("_")[2])
-    await worker_manager.stop_worker(account_id)
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-        await db.commit()
-    
-    await log_to_db(account_id, "INFO", "Аккаунт удалён")
-    await callback.answer("✅ Аккаунт удалён", show_alert=True)
-    await accounts_list(callback)
-
-# ==================== НАСТРОЙКИ ТЕКСТОВ ====================
-
-@router_settings.callback_query(F.data == "set_texts")
-async def set_texts_menu(callback: CallbackQuery):
-    accounts = await get_accounts_status()
-    
-    if not accounts:
-        await callback.answer("❌ Добавьте аккаунты", show_alert=True)
-        return
-    
-    buttons = []
-    for acc_id, phone, _, _ in accounts:
-        phone_masked = f"{phone[:4]}***{phone[-3:]}"
-        buttons.append([InlineKeyboardButton(text=f"Аккаунт {acc_id} ({phone_masked})", 
-                                            callback_data=f"set_text_acc_{acc_id}")])
-    
-    buttons.append([InlineKeyboardButton(text="📋 Посмотреть все", callback_data="view_all_texts")])
-    buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text("📝 Выберите аккаунт:", reply_markup=keyboard)
-    await callback.answer()
-
-@router_settings.callback_query(F.data.startswith("set_text_acc_"))
-async def set_text_account(callback: CallbackQuery, state: FSMContext):
-    account_id = int(callback.data.split("_")[3])
-    
-    await callback.message.edit_text(f"📝 Введите текст для Аккаунта {account_id}:\n\nОтменить: /cancel")
-    await state.update_data(account_id=account_id)
-    await state.set_state(TextSettings.ENTER_TEXT)
-    await callback.answer()
-
-@router_settings.message(TextSettings.ENTER_TEXT)
-async def process_greeting_text(message: Message, state: FSMContext):
-    data = await state.get_data()
-    account_id = data['account_id']
-    greeting_text = message.text
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE accounts SET greeting_text = ? WHERE id = ?", 
-                        (greeting_text, account_id))
-        await db.commit()
-    
-    await message.answer(f"✅ Текст для Аккаунта {account_id} сохранён!")
     await state.clear()
-    await show_main_menu(message)
+    await message.answer("✅ Операция отменена", reply_markup=get_main_menu_keyboard())
 
-@router_settings.callback_query(F.data == "view_all_texts")
-async def view_all_texts(callback: CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id, phone, greeting_text FROM accounts ORDER BY id")
-        accounts = await cursor.fetchall()
-    
-    if not accounts:
-        await callback.answer("❌ Аккаунты не добавлены", show_alert=True)
-        return
-    
-    text = "📝 ТЕКСТЫ:\n\n"
-    for acc_id, phone, greeting in accounts:
-        phone_masked = f"{phone[:4]}***{phone[-3:]}"
-        text += f"Аккаунт {acc_id} ({phone_masked}):\n└ {greeting}\n\n"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="set_texts")]
-    ])
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
+# ==================== ОБРАБОТЧИКИ CALLBACK ====================
 
-# ==================== НАСТРОЙКИ ЗАДЕРЖЕК ====================
-
-@router_settings.callback_query(F.data == "set_cooldowns")
-async def set_cooldowns_menu(callback: CallbackQuery):
-    accounts = await get_accounts_status()
-    
-    if not accounts:
-        await callback.answer("❌ Добавьте аккаунты", show_alert=True)
-        return
-    
-    buttons = []
-    for acc_id, phone, _, _ in accounts:
-        phone_masked = f"{phone[:4]}***{phone[-3:]}"
-        buttons.append([InlineKeyboardButton(text=f"Аккаунт {acc_id} ({phone_masked})", 
-                                            callback_data=f"set_cooldown_acc_{acc_id}")])
-    
-    buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text("⏱ Выберите аккаунт:", reply_markup=keyboard)
-    await callback.answer()
-
-@router_settings.callback_query(F.data.startswith("set_cooldown_acc_"))
-async def set_cooldown_account(callback: CallbackQuery, state: FSMContext):
-    account_id = int(callback.data.split("_")[3])
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("""
-            SELECT cooldown_search, cooldown_send, cooldown_skip 
-            FROM accounts WHERE id = ?
-        """, (account_id,))
-        result = await cursor.fetchone()
-    
-    if not result:
-        await callback.answer("❌ Аккаунт не найден", show_alert=True)
-        return
-    
-    cd_search, cd_send, cd_skip = result
-    
+@router.callback_query(F.data == "upload_image")
+async def callback_upload_image(callback: CallbackQuery, state: FSMContext):
+    """Начало загрузки изображения"""
     await callback.message.edit_text(
-        f"⏱ Текущие задержки Аккаунта {account_id}:\n\n"
-        f"├ Между поисками: {cd_search} сек\n"
-        f"├ Перед отправкой: {cd_send} сек\n"
-        f"└ После скипа: {cd_skip} сек\n\n"
-        f"Введите новые (через пробел):\n"
-        f"Пример: 25 5 20\n\nОтменить: /cancel"
+        "📸 Отправьте мне изображение\n\n"
+        "💡 Для лучшего качества отправляйте как файл (не сжатое фото)\n\n"
+        "Минимальный размер: 512px на меньшей стороне",
+        reply_markup=get_cancel_keyboard()
     )
-    
-    await state.update_data(account_id=account_id)
-    await state.set_state(CooldownSettings.ENTER_VALUES)
+    await state.set_state(ImageProcessing.WAITING_IMAGE)
     await callback.answer()
 
-@router_settings.message(CooldownSettings.ENTER_VALUES)
-async def process_cooldown_values(message: Message, state: FSMContext):
-    data = await state.get_data()
-    account_id = data['account_id']
-    
-    try:
-        values = message.text.strip().split()
-        if len(values) != 3:
-            await message.answer("❌ Введите 3 числа через пробел")
-            return
-        
-        cd_search, cd_send, cd_skip = map(int, values)
-        
-        if any(v <= 0 for v in [cd_search, cd_send, cd_skip]):
-            await message.answer("❌ Все значения должны быть > 0")
-            return
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("""
-                UPDATE accounts 
-                SET cooldown_search = ?, cooldown_send = ?, cooldown_skip = ?
-                WHERE id = ?
-            """, (cd_search, cd_send, cd_skip, account_id))
-            await db.commit()
-        
-        await message.answer(f"✅ Задержки для Аккаунта {account_id} сохранены")
-        await state.clear()
-        await show_main_menu(message)
-    except ValueError:
-        await message.answer("❌ Неверный формат")
+@router.callback_query(F.data == "show_help")
+async def callback_show_help(callback: CallbackQuery):
+    """Показать помощь"""
+    help_text = """
+ℹ️ ПОМОЩЬ
 
-# ==================== НАСТРОЙКИ ТАЙМАУТОВ ====================
+📋 Доступные размеры сетки:
+• 3x4 (12 стикеров)
+• 4x6 (24 стикера)
+• 5x8 (40 стикеров)
+• 7x9 (63 стикера)
+• 9x11 (99 стикеров)
 
-@router_settings.callback_query(F.data == "set_timeouts")
-async def set_timeouts_menu(callback: CallbackQuery):
-    accounts = await get_accounts_status()
+💡 Чем больше сетка, тем детальнее будет мозаика!
+
+🎨 После получения стикерпака:
+1. Откройте стикерпак по ссылке
+2. Отправляйте стикеры по порядку (слева-направо, сверху-вниз)
+3. Создавайте крутые мозаичные картины в чатах!
+"""
     
-    if not accounts:
-        await callback.answer("❌ Добавьте аккаунты", show_alert=True)
-        return
-    
-    buttons = []
-    for acc_id, phone, _, _ in accounts:
-        phone_masked = f"{phone[:4]}***{phone[-3:]}"
-        buttons.append([InlineKeyboardButton(text=f"Аккаунт {acc_id} ({phone_masked})", 
-                                            callback_data=f"set_timeout_acc_{acc_id}")])
-    
-    buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text("⏰ Выберите аккаунт:", reply_markup=keyboard)
+    await callback.message.edit_text(help_text, reply_markup=get_main_menu_keyboard())
     await callback.answer()
 
-@router_settings.callback_query(F.data.startswith("set_timeout_acc_"))
-async def set_timeout_account(callback: CallbackQuery, state: FSMContext):
-    account_id = int(callback.data.split("_")[3])
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("""
-            SELECT timeout_reply FROM accounts WHERE id = ?
-        """, (account_id,))
-        result = await cursor.fetchone()
-    
-    if not result:
-        await callback.answer("❌ Аккаунт не найден", show_alert=True)
-        return
-    
-    timeout_reply = result[0]
-    
+@router.callback_query(F.data == "back_to_menu")
+async def callback_back_to_menu(callback: CallbackQuery, state: FSMContext):
+    """Вернуться в главное меню"""
+    await state.clear()
     await callback.message.edit_text(
-        f"⏰ Текущий таймаут ожидания ответа:\n"
-        f"Аккаунт {account_id}: {timeout_reply} секунд\n\n"
-        f"Введите новое значение в секундах:\n"
-        f"Пример: 120 (для 2 минут)\n\n"
-        f"Рекомендуемые значения:\n"
-        f"├ 60 сек (1 минута)\n"
-        f"├ 90 сек (1.5 минуты) - по умолчанию\n"
-        f"├ 120 сек (2 минуты)\n"
-        f"└ 180 сек (3 минуты)\n\n"
-        f"Отменить: /cancel"
+        "📊 Главное меню",
+        reply_markup=get_main_menu_keyboard()
     )
-    
-    await state.update_data(account_id=account_id)
-    await state.set_state(TimeoutSettings.ENTER_TIMEOUT)
     await callback.answer()
 
-@router_settings.message(TimeoutSettings.ENTER_TIMEOUT)
-async def process_timeout_value(message: Message, state: FSMContext):
-    data = await state.get_data()
-    account_id = data['account_id']
+@router.callback_query(F.data == "cancel")
+async def callback_cancel(callback: CallbackQuery, state: FSMContext):
+    """Отмена операции"""
+    await state.clear()
+    await callback.message.edit_text(
+        "✅ Операция отменена",
+        reply_markup=get_main_menu_keyboard()
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("grid_"))
+async def callback_grid_selection(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора размера сетки"""
+    grid_size = callback.data.replace('grid_', '')
     
-    try:
-        timeout_value = int(message.text.strip())
-        
-        if timeout_value < 30:
-            await message.answer("❌ Минимальное значение: 30 секунд")
-            return
-        
-        if timeout_value > 600:
-            await message.answer("❌ Максимальное значение: 600 секунд (10 минут)")
-            return
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("""
-                UPDATE accounts 
-                SET timeout_reply = ?
-                WHERE id = ?
-            """, (timeout_value, account_id))
-            await db.commit()
-        
-        await message.answer(
-            f"✅ Таймаут для Аккаунта {account_id} обновлён!\n\n"
-            f"Новое значение: {timeout_value} секунд ({timeout_value // 60} мин {timeout_value % 60} сек)\n\n"
-            f"⚠️ Перезапустите воркер, чтобы изменения вступили в силу."
+    if grid_size not in GRID_SIZES:
+        await callback.answer("❌ Неверный размер сетки", show_alert=True)
+        return
+    
+    cols, rows = GRID_SIZES[grid_size]
+    
+    # Получаем сохранённые данные изображения
+    data = await state.get_data()
+    file_id = data.get('image_file_id')
+    
+    if not file_id:
+        await callback.message.edit_text(
+            "❌ Данные изображения не найдены. Пожалуйста, отправьте изображение снова.",
+            reply_markup=get_main_menu_keyboard()
         )
         await state.clear()
-        await show_main_menu(message)
-    except ValueError:
-        await message.answer("❌ Введите целое число")
-
-# ==================== НАСТРОЙКИ ПАТТЕРНОВ ====================
-
-@router_settings.callback_query(F.data == "set_patterns")
-async def patterns_menu(callback: CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("""
-            SELECT partner_found, partner_skipped, already_in_dialog, system_messages 
-            FROM bot_patterns WHERE id = 1
-        """)
-        result = await cursor.fetchone()
+        return
     
-    if not result:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("""
-                INSERT INTO bot_patterns (id, partner_found, partner_skipped, already_in_dialog, system_messages)
-                VALUES (1, 'Нашёл собеседника!', '🤚|||завершил диалог', '🔴|||недоступна в диалоге', '🛑 Подпишись|||оставить отзыв')
-            """)
-            await db.commit()
-        result = ('Нашёл собеседника!', '🤚|||завершил диалог', '🔴|||недоступна в диалоге', '🛑 Подпишись|||оставить отзыв')
-    
-    partner_found, partner_skipped, already_in_dialog, system_messages = result
-    
-    text = f"""
-🔤 ПАТТЕРНЫ БОТА
-
-Эти фразы бот ищет в сообщениях для определения событий.
-
-📌 Разделяйте фразы через |||
-
-1️⃣ Собеседник найден:
-{partner_found}
-
-2️⃣ Собеседник скипнул:
-{partner_skipped}
-
-3️⃣ Уже в диалоге:
-{already_in_dialog}
-
-4️⃣ Системные сообщения (игнорировать):
-{system_messages}
-"""
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1️⃣ Изменить: Найден", callback_data="pattern_partner_found")],
-        [InlineKeyboardButton(text="2️⃣ Изменить: Скипнул", callback_data="pattern_partner_skipped")],
-        [InlineKeyboardButton(text="3️⃣ Изменить: В диалоге", callback_data="pattern_already_in_dialog")],
-        [InlineKeyboardButton(text="4️⃣ Изменить: Системные", callback_data="pattern_system_messages")],
-        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")]
-    ])
-    
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
-
-@router_settings.callback_query(F.data.startswith("pattern_"))
-async def edit_pattern(callback: CallbackQuery, state: FSMContext):
-    field = callback.data.replace("pattern_", "")
-    
-    field_names = {
-        'partner_found': '1️⃣ Собеседник найден',
-        'partner_skipped': '2️⃣ Собеседник скипнул',
-        'already_in_dialog': '3️⃣ Уже в диалоге',
-        'system_messages': '4️⃣ Системные сообщения'
-    }
-    
+    # Обновляем сообщение
     await callback.message.edit_text(
-        f"✏️ Редактирование: {field_names[field]}\n\n"
-        f"Введите новые фразы через |||\n\n"
-        f"Пример:\n"
-        f"Нашёл собеседника!|||Собеседник найден\n\n"
-        f"Отменить: /cancel"
+        f"⚙️ Обработка изображения в сетку {grid_size} ({cols}x{rows} = {cols*rows} стикеров)...\n\n"
+        "Это может занять 1-2 минуты. Пожалуйста, подождите! ⏳"
+    )
+    await callback.answer()
+    
+    # Создаём временную директорию
+    temp_dir = tempfile.mkdtemp()
+    
+    try:
+        # Скачиваем изображение
+        file = await callback.bot.get_file(file_id)
+        image_path = os.path.join(temp_dir, 'original.jpg')
+        await callback.bot.download_file(file.file_path, image_path)
+        
+        # Открываем и обрабатываем изображение
+        with Image.open(image_path) as img:
+            # Конвертируем в RGB если нужно
+            if img.mode not in ('RGB', 'RGBA'):
+                img = img.convert('RGB')
+            
+            # Проверяем минимальный размер
+            min_dimension = min(img.width, img.height)
+            if min_dimension < 512:
+                await callback.message.edit_text(
+                    f"❌ Изображение слишком маленькое ({img.width}x{img.height}).\n"
+                    f"Пожалуйста, отправьте изображение минимум 512px на меньшей стороне.",
+                    reply_markup=get_main_menu_keyboard()
+                )
+                await state.clear()
+                return
+            
+            # Обрабатываем изображение
+            processor = ImageProcessor()
+            
+            # Ресайз и обрезка под соотношение сторон сетки
+            processed_img = processor.resize_and_crop(img, cols, rows)
+            
+            # Разрезаем на сетку
+            slices = processor.slice_image(processed_img, cols, rows)
+            
+            # Конвертируем куски в формат стикеров
+            sticker_files = []
+            for slice_img in slices:
+                sticker_data = processor.prepare_sticker(slice_img)
+                sticker_files.append(sticker_data)
+            
+            logger.info(f"Создано {len(sticker_files)} стикеров для пользователя {callback.from_user.id}")
+        
+        # Создаём стикерпак
+        pack_manager = StickerPackManager()
+        pack_name = pack_manager.generate_pack_name(callback.from_user.id)
+        pack_title = f"My {grid_size} Grid Image"
+        
+        await callback.message.edit_text(
+            f"📦 Создание стикерпака с {len(sticker_files)} стикерами...\n"
+            "Это может занять минуту! ⏳"
+        )
+        
+        success = await pack_manager.create_sticker_pack(
+            bot=callback.bot,
+            user_id=callback.from_user.id,
+            pack_name=pack_name,
+            pack_title=pack_title,
+            stickers=sticker_files,
+        )
+        
+        if success:
+            pack_url = f"https://t.me/addstickers/{pack_name}"
+            
+            result_text = f"""
+✅ Готово! Ваш стикерпак создан!
+
+🎨 Название: {pack_title}
+📊 Сетка: {grid_size} ({cols*rows} стикеров)
+
+🔗 Добавить в Telegram:
+{pack_url}
+
+💡 Как использовать:
+1. Откройте стикерпак по ссылке выше
+2. Отправляйте стикеры по порядку (слева-направо, сверху-вниз)
+3. Создавайте мозаику в чатах!
+
+📸 Отправьте ещё одно изображение для создания нового пака!
+"""
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔗 Открыть стикерпак", url=pack_url)],
+                [InlineKeyboardButton(text="📸 Создать ещё", callback_data="upload_image")],
+                [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_menu")]
+            ])
+            
+            await callback.message.edit_text(result_text, reply_markup=keyboard)
+        else:
+            await callback.message.edit_text(
+                "❌ Не удалось создать стикерпак. Пожалуйста, попробуйте ещё раз или обратитесь в поддержку.",
+                reply_markup=get_main_menu_keyboard()
+            )
+        
+        await state.clear()
+    
+    except Exception as e:
+        logger.error(f"Ошибка обработки изображения: {e}", exc_info=True)
+        await callback.message.edit_text(
+            f"❌ Произошла ошибка при обработке:\n{str(e)}\n\n"
+            "Пожалуйста, попробуйте с другим изображением.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        await state.clear()
+    
+    finally:
+        # Очистка временной директории
+        try:
+            shutil.rmtree(temp_dir)
+            logger.info(f"Очищена временная директория: {temp_dir}")
+        except Exception as e:
+            logger.error(f"Ошибка очистки временной директории: {e}")
+
+# ==================== ОБРАБОТЧИКИ СООБЩЕНИЙ ====================
+
+@router.message(ImageProcessing.WAITING_IMAGE, F.photo | F.document)
+async def handle_image(message: Message, state: FSMContext):
+    """Обработка полученного изображения"""
+    # Получаем file_id в зависимости от типа сообщения
+    if message.photo:
+        # Пользователь отправил сжатое фото
+        file_id = message.photo[-1].file_id  # Берём самое высокое разрешение
+        await message.answer(
+            "📸 Получено фото!\n\n"
+            "💡 Для лучшего качества в следующий раз отправьте как файл\n\n"
+            "⏳ Подготовка опций..."
+        )
+    elif message.document:
+        # Пользователь отправил файл
+        document = message.document
+        # Проверяем, что это изображение
+        if not document.mime_type or not document.mime_type.startswith('image/'):
+            await message.answer(
+                "❌ Пожалуйста, отправьте файл изображения (JPG, PNG и т.д.)",
+                reply_markup=get_cancel_keyboard()
+            )
+            return
+        file_id = document.file_id
+        await message.answer("📁 Получен файл изображения!\n⏳ Подготовка опций...")
+    else:
+        await message.answer(
+            "❌ Пожалуйста, отправьте изображение",
+            reply_markup=get_cancel_keyboard()
+        )
+        return
+    
+    # Сохраняем file_id в состоянии
+    await state.update_data(image_file_id=file_id)
+    
+    # Показываем клавиатуру выбора размера сетки
+    await message.answer(
+        "🎯 Выберите размер сетки:\n\n"
+        "Сетка определяет, на сколько частей будет разрезано изображение.",
+        reply_markup=get_grid_size_keyboard()
     )
     
-    await state.update_data(pattern_field=field)
-    await state.set_state(PatternSettings.EDIT_FIELD)
-    await callback.answer()
+    await state.set_state(ImageProcessing.SELECTING_GRID)
 
-@router_settings.message(PatternSettings.EDIT_FIELD)
-async def process_pattern(message: Message, state: FSMContext):
-    data = await state.get_data()
-    field = data['pattern_field']
-    value = message.text.strip()
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(f"""
-            UPDATE bot_patterns SET {field} = ? WHERE id = 1
-        """, (value,))
-        await db.commit()
-    
-    await message.answer("✅ Паттерн обновлён!")
-    await state.clear()
-    await show_main_menu(message)
+@router.message(ImageProcessing.WAITING_IMAGE)
+async def handle_wrong_content(message: Message):
+    """Обработка неправильного типа контента"""
+    await message.answer(
+        "❌ Пожалуйста, отправьте изображение (фото или файл)",
+        reply_markup=get_cancel_keyboard()
+    )
 
-# ==================== УПРАВЛЕНИЕ ====================
-
-@router_control.callback_query(F.data == "start_all")
-async def start_all_accounts(callback: CallbackQuery):
-    accounts = await get_accounts_status()
-    
-    if not accounts:
-        await callback.answer("❌ Нет аккаунтов", show_alert=True)
-        return
-    
-    started_count = 0
-    for acc_id, _, _, is_active in accounts:
-        if is_active and acc_id not in worker_manager.workers:
-            if await worker_manager.start_worker(acc_id, callback.bot):
-                started_count += 1
-    
-    await callback.answer(f"▶️ Запущено {started_count} аккаунтов", show_alert=True)
-    await log_to_db(None, "INFO", f"Запущены все ({started_count})")
-    await callback_main_menu(callback)
-
-@router_control.callback_query(F.data == "pause_all")
-async def pause_all_accounts(callback: CallbackQuery):
-    await worker_manager.pause_all_workers()
-    await callback.answer("⏸ Все на паузе", show_alert=True)
-    await log_to_db(None, "INFO", "Все на паузе")
-    await callback_main_menu(callback)
-
-@router_control.callback_query(F.data == "stop_all")
-async def stop_all_accounts(callback: CallbackQuery):
-    await worker_manager.stop_all_workers()
-    await callback.answer("⏹ Все остановлены", show_alert=True)
-    await log_to_db(None, "INFO", "Все остановлены")
-    await callback_main_menu(callback)
-
-@router_control.callback_query(F.data.startswith("worker_stop_dialog_"))
-async def worker_stop_dialog(callback: CallbackQuery):
-    account_id = int(callback.data.split("_")[3])
-    worker = await worker_manager.get_worker(account_id)
-    
-    if worker:
-        try:
-            await worker.client.send_message(TARGET_BOT, '/stop')
-            await log_to_db(account_id, "INFO", "Отправлен /stop")
-        except Exception as e:
-            await log_to_db(account_id, "ERROR", f"Ошибка /stop: {e}")
-        
-        await worker.pause()
-        await callback.answer("✅ Диалог остановлен, воркер на паузе", show_alert=True)
-    else:
-        await callback.answer("❌ Воркер не найден", show_alert=True)
-    
-    await callback.message.delete()
-
-@router_control.callback_query(F.data.startswith("worker_skip_"))
-async def worker_skip(callback: CallbackQuery):
-    account_id = int(callback.data.split("_")[2])
-    worker = await worker_manager.get_worker(account_id)
-    
-    if worker:
-        await worker.skip_dialog()
-        await callback.answer("✅ Скип выполнен", show_alert=True)
-    else:
-        await callback.answer("❌ Воркер не найден", show_alert=True)
-    
-    await callback.message.delete()
-
-@router_control.callback_query(F.data.startswith("worker_wait_"))
-async def worker_wait(callback: CallbackQuery):
-    account_id = int(callback.data.split("_")[2])
-    worker = await worker_manager.get_worker(account_id)
-    
-    if worker:
-        await worker.wait_more()
-        await callback.answer("✅ Ожидание продолжено", show_alert=True)
-    else:
-        await callback.answer("❌ Воркер не найден", show_alert=True)
-    
-    await callback.message.delete()
-
-# ==================== СТАТИСТИКА ====================
-
-@router_stats.callback_query(F.data == "stats_menu")
-async def stats_menu(callback: CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("""
-            SELECT SUM(total_dialogs), SUM(total_skips), SUM(total_replies), 
-                   SUM(total_timeouts), AVG(avg_response_time)
-            FROM stats
-        """)
-        result = await cursor.fetchone()
-    
-    total_dialogs = result[0] or 0
-    total_skips = result[1] or 0
-    total_replies = result[2] or 0
-    total_timeouts = result[3] or 0
-    avg_response = result[4] or 0
-    
-    # Живые метрики из активных воркеров
-    live_metrics = {
-        'dialogs': 0,
-        'replies': 0,
-        'skips': 0,
-        'timeouts': 0,
-        'avg_time': 0
-    }
-    
-    active_workers = 0
-    for acc_id in worker_manager.workers:
-        worker = await worker_manager.get_worker(acc_id)
-        if worker:
-            active_workers += 1
-            live_metrics['dialogs'] += worker.metrics['dialogs_started']
-            live_metrics['replies'] += worker.metrics['replies_received']
-            live_metrics['skips'] += worker.metrics['skips']
-            live_metrics['timeouts'] += worker.metrics['timeouts']
-            if worker.metrics['avg_response_time'] > 0:
-                live_metrics['avg_time'] += worker.metrics['avg_response_time']
-    
-    if active_workers > 0:
-        live_metrics['avg_time'] /= active_workers
-    
-    text = f"""
-📊 СТАТИСТИКА
-
-📈 Всего за всё время:
-├ Диалогов: {total_dialogs}
-├ Скипов: {total_skips}
-├ Ответов: {total_replies}
-├ Таймаутов: {total_timeouts}
-└ Средний ответ: {avg_response:.1f} сек
-
-🔴 Текущая сессия ({active_workers} активных):
-├ Диалогов: {live_metrics['dialogs']}
-├ Скипов: {live_metrics['skips']}
-├ Ответов: {live_metrics['replies']}
-├ Таймаутов: {live_metrics['timeouts']}
-└ Средний ответ: {live_metrics['avg_time']:.1f} сек
-"""
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")]
-    ])
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
-
-# ==================== ЛОГИ ====================
-
-@router_logs.callback_query(F.data == "logs_menu")
-async def logs_menu(callback: CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("""
-            SELECT level, message, timestamp 
-            FROM logs 
-            ORDER BY timestamp DESC 
-            LIMIT 10
-        """)
-        logs = await cursor.fetchall()
-    
-    if not logs:
-        text = "📄 ЛОГИ\n\nЛогов пока нет"
-    else:
-        text = "📄 ПОСЛЕДНИЕ 10 ЛОГОВ:\n\n"
-        for level, message, timestamp in logs:
-            emoji = "ℹ️" if level == "INFO" else "⚠️" if level == "WARNING" else "❌"
-            time_str = timestamp.split('.')[0] if '.' in timestamp else timestamp
-            text += f"{emoji} [{time_str}] {message}\n"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💾 Скачать полные логи", callback_data="download_logs")],
-        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")]
-    ])
-    
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
-
-@router_logs.callback_query(F.data == "download_logs")
-async def download_logs(callback: CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("""
-            SELECT account_id, level, message, extra, timestamp 
-            FROM logs 
-            ORDER BY timestamp DESC
-        """)
-        logs = await cursor.fetchall()
-    
-    if not logs:
-        await callback.answer("❌ Логов нет", show_alert=True)
-        return
-    
-    log_content = "TELEGRAM AUTOMATION BOT v2.0 - LOGS\n" + "=" * 60 + "\n\n"
-    
-    for account_id, level, message, extra, timestamp in logs:
-        acc_str = f"ACC_{account_id}" if account_id else "SYSTEM"
-        log_content += f"[{timestamp}] [{acc_str}] [{level}] {message}\n"
-        if extra:
-            log_content += f"  Extra: {extra}\n"
-    
-    log_file_path = "logs/bot_logs.txt"
-    os.makedirs('logs', exist_ok=True)
-    
-    with open(log_file_path, 'w', encoding='utf-8') as f:
-        f.write(log_content)
-    
-    log_file = FSInputFile(log_file_path)
-    await callback.message.answer_document(log_file, caption="📄 Полные логи")
-    await callback.answer("✅ Логи отправлены")
+@router.message()
+async def handle_any_message(message: Message):
+    """Обработка любых других сообщений"""
+    await message.answer(
+        "👋 Используйте /start для начала работы сботом",
+        reply_markup=get_main_menu_keyboard()
+    )
 
 # ==================== ГЛАВНАЯ ФУНКЦИЯ ====================
 
 async def main():
+    """Главная функция запуска бота"""
     print("=" * 60)
-    print("🚀 Запуск Telegram Automation Bot v2.0")
-    print("=" * 60)
-    
-    print("📦 Инициализация БД...")
-    await init_database(PASSWORD)
-    print("✅ БД готова")
+    print("🚀 Запуск Image to Sticker Pack Bot")
     print("=" * 60)
     
-    bot = Bot(token=TOKEN)
+    # Создаём необходимые директории
+    os.makedirs('logs', exist_ok=True)
+    
+    # Инициализация бота
+    bot = Bot(token=BOT_TOKEN)
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
     
-    # Подключаем все роутеры
-    dp.include_router(router_init)
-    dp.include_router(router_start)
-    dp.include_router(router_accounts)
-    dp.include_router(router_settings)
-    dp.include_router(router_control)
-    dp.include_router(router_stats)
-    dp.include_router(router_logs)
+    # Подключаем роутер
+    dp.include_router(router)
     
-    # Подключаем middleware
-    dp.message.middleware(check_authorization_middleware)
-    dp.callback_query.middleware(check_authorization_middleware)
-    
+    # Получаем информацию о боте
     bot_info = await bot.get_me()
     print(f"🤖 Бот: @{bot_info.username}")
     print(f"🆔 Bot ID: {bot_info.id}")
+    print(f"📝 Bot Username (для стикерпаков): {BOT_USERNAME}")
     print("=" * 60)
-    print("✅ Бот запущен и готов к работе!")
-    print("📱 Отправьте /start боту для начала работы")
+    print("✅ Бот успешно запущен!")
+    print("💡 Нажмите Ctrl+C для остановки")
     print("=" * 60)
     
     try:
-        await dp.start_polling(bot)
+        # Запуск polling
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     except KeyboardInterrupt:
         print("\n⚠️  Получен сигнал остановки...")
     finally:
-        print("\n🛑 Остановка всех воркеров...")
-        await worker_manager.stop_all_workers()
         await bot.session.close()
-        print("✅ Бот полностью остановлен")
+        print("✅ Бот остановлен")
+
+# ==================== ТОЧКА ВХОДА ====================
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 До свидания!")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+        sys.exit(1)
